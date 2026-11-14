@@ -1,0 +1,30 @@
+# Library sources from https://github.com/vladkens/macmon, tag v0.8.2 (MIT).
+# Local changes balance CoreFoundation ownership and Mach port rights during sampling.
+[package]
+name = "macmon"
+version = "0.8.2"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/vladkens/macmon"
+
+[lib]
+path = "src_lib/lib.rs"
+
+[features]
+app = []
+
+[dependencies]
+core-foundation = "0.10.1"
+libc = "0.2.189"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+[lints.rust]
+non_camel_case_types = "allow"
+unreachable_code = "allow"
+unused_assignments = "allow"
+unused_imports = "deny"
+
+[lints.clippy]
+needless_range_loop = "allow"
+single_match = "allow"
