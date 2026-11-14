@@ -1,6 +1,6 @@
 [package]
 name = "msense"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Apple Silicon CPU/GPU/RAM monitor with CLI and macOS menu bar app"
 license = "MIT"
@@ -14,7 +14,10 @@ name = "msense-menu"
 path = "src/bin/msense-menu.rs"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-macmon = "0.8.2"
+macmon = { path = "vendor/macmon" }
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSBundle", "NSString", "NSUserDefaults"] }
+objc2-service-management = { version = "0.3.2", default-features = false, features = ["std", "SMAppService", "objc2", "objc2-foundation"] }
 tray-icon = "0.21.1"
 winit = "0.30"
 

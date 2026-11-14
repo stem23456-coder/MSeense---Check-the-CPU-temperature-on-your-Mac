@@ -34,9 +34,11 @@ Intel Macs are not supported.
 ### Installation
 
 1. Open the [Releases](../../releases) page.
-2. Download `MSense-0.1.0-macOS-arm64.dmg` using Safari, Chrome, or Firefox.
+2. Download `MSense-0.2.0-macOS-arm64.dmg` using Safari, Chrome, or Firefox.
 3. Open the DMG and drag `MSense.app` into `Applications`.
 4. Launch MSense. It runs in the menu bar, so it does not show a Dock icon or a main window.
+
+On macOS 13 or later, open MSense from `/Applications` or `~/Applications` once to enable launch at login. Use **Launch at Login** in the MSense menu to turn it off or on. If approval is required, click the same item to open System Settings.
 
 #### First launch on macOS
 
@@ -56,10 +58,9 @@ For Telegram, use the release asset ending in `-dmg.zip`. It contains the DMG in
 Install the Rust toolchain and Apple Command Line Tools, then run:
 
 ```bash
-git clone https://github.com/YOUR_GITHUB_USERNAME/msense-macos.git
-cd msense-macos
-chmod +x build-msense-app-free.sh
-BUNDLE_ID="io.github.YOUR_GITHUB_USERNAME.msense" ./build-msense-app-free.sh
+git clone https://github.com/stem23456-coder/MSeense---Check-the-CPU-temperature-on-your-Mac.git msense
+cd msense
+bash build-msense-app-free.sh
 ```
 
 The finished application and release packages will be created in `dist/`.
@@ -118,9 +119,11 @@ MSense — лёгкая open-source утилита для мониторинга
 ### Установка
 
 1. Откройте страницу [Releases](../../releases).
-2. Скачайте `MSense-0.1.0-macOS-arm64.dmg` через Safari, Chrome или Firefox.
+2. Скачайте `MSense-0.2.0-macOS-arm64.dmg` через Safari, Chrome или Firefox.
 3. Откройте DMG и перетащите `MSense.app` в папку «Программы».
 4. Запустите MSense. Утилита работает в строке меню, поэтому у неё нет главного окна и значка в Dock.
+
+На macOS 13 и новее при первом открытии из `/Applications` или `~/Applications` MSense включает запуск при входе. Галочка **Launch at Login** в меню позволяет отключить или снова включить автозапуск. Если требуется одобрение macOS, этот же пункт откроет системные настройки.
 
 Если macOS заблокирует первый запуск, один раз попробуйте открыть MSense, затем перейдите в **Системные настройки → Конфиденциальность и безопасность → Безопасность** и нажмите **Открыть всё равно**.
 
@@ -129,10 +132,9 @@ MSense — лёгкая open-source утилита для мониторинга
 ### Сборка из исходного кода
 
 ```bash
-git clone https://github.com/YOUR_GITHUB_USERNAME/msense-macos.git
-cd msense-macos
-chmod +x build-msense-app-free.sh
-BUNDLE_ID="io.github.YOUR_GITHUB_USERNAME.msense" ./build-msense-app-free.sh
+git clone https://github.com/stem23456-coder/MSeense---Check-the-CPU-temperature-on-your-Mac.git msense
+cd msense
+bash build-msense-app-free.sh
 ```
 
 Готовые файлы появятся в папке `dist/`.
