@@ -320,6 +320,11 @@ pub struct IOReportIterator {
 }
 
 impl IOReportIterator {
+  fn from_sample(data: CFDictionaryRef) -> Self {
+    // Subscriptions can omit channels and samples can reorder them on newer
+    // macOS releases. Metadata must describe the sample, not the request.
+    Self::new(data, cfio_channel_metadata(data))
+  }
   /// Create an iterator from raw IOReport sample data and channel metadata.
   pub fn new(data: CFDictionaryRef, metadata: Vec<(String, String, String, String)>) -> Self {
     let items = cfdict_get_val(data, "IOReportChannels").unwrap() as CFArrayRef;
@@ -472,6 +477,8 @@ pub struct SocInfo {
   pub ecpu_cores: u8,
   /// Number of performance-tier CPU cores.
   pub pcpu_cores: u8,
+  /// Middle-tier Performance cores on three-tier chips (M6).
+  pub mcpu_cores: u8,
   /// UI label for the lower CPU tier, for example `E` on M1-M4 or `P` on M5+.
   pub ecpu_label: String,
   /// UI label for the higher CPU tier, for example `P` on M1-M4 or `S` on M5+.
@@ -480,6 +487,8 @@ pub struct SocInfo {
   pub ecpu_freqs: Vec<u32>,
   /// Supported higher-tier CPU frequencies in MHz.
   pub pcpu_freqs: Vec<u32>,
+  /// Frequencies of the middle tier in MHz, when present.
+  pub mcpu_freqs: Vec<u32>,
   /// Number of GPU cores.
   pub gpu_cores: u8,
   /// Supported GPU frequencies in MHz.
@@ -499,8 +508,8 @@ pub fn get_dvfs_mhz(dict: CFDictionaryRef, key: &str) -> Option<(Vec<u32>, Vec<u
   unsafe {
     let obj = cfdict_get_val(dict, key)? as CFDataRef;
     let obj_len = CFDataGetLength(obj);
-    let obj_val = vec![0u8; obj_len as usize];
-    CFDataGetBytes(obj, CFRange::init(0, obj_len), obj_val.as_ptr() as *mut u8);
+    let mut obj_val = vec![0u8; obj_len as usize];
+    CFDataGetBytes(obj, CFRange::init(0, obj_len), obj_val.as_mut_ptr());
 
     // obj_val is pairs of (freq, voltage) 4 bytes each
     let items_count = (obj_len / 8) as usize;
@@ -598,6 +607,7 @@ pub(crate) struct HwInfo {
   pub(crate) memory_gb: u16,
   pub(crate) ecpu_cores: u8,
   pub(crate) pcpu_cores: u8,
+  pub(crate) mcpu_cores: u8,
   pub(crate) ecpu_label: String,
   pub(crate) pcpu_label: String,
   pub(crate) gpu_cores: u8,
@@ -651,24 +661,34 @@ fn cfnum_get_i64(dict: CFDictionaryRef, key: &str) -> Option<i64> {
   ok.then_some(val)
 }
 
-// perflevel0 is Apple's highest-capability CPU cluster, the last perflevel is the
-// lowest (confirmed via `sysctl hw.perflevel0/1.name` -> Performance/Efficiency on
-// M1-M4). M5 drops E-cores for a new higher "Super" tier above Performance, so the
-// same two-slot ecpu/pcpu split still applies, just relabeled P/S instead of E/P.
-// Unverified on real M5 hardware (see hw_from_profiler for the tested fallback path).
-fn cpu_tier_counts(chip_name: &str) -> Option<(u8, u8, &'static str, &'static str)> {
-  let nperflevels = sysctl_u32("hw.nperflevels")?;
-  if nperflevels < 2 {
+// perflevels are highest first. Read their names: base M5 is E/S, M5 Pro/Max
+// is P/S, and M6 exposes all three tiers as Super / Performance / Efficiency.
+fn topology_from_perflevels(
+  cores: &[u32], names: &[Option<String>], chip_name: &str,
+) -> Option<(u8, u8, u8, &'static str, &'static str)> {
+  let (hi, mid, lo) = match *cores {
+    [hi, lo] => (hi, 0, lo),
+    [hi, mid, lo] => (hi, mid, lo),
+    _ => return None,
+  };
+  if hi == 0 || lo == 0 || [hi, mid, lo].iter().any(|n| *n > u8::MAX as u32) {
     return None;
   }
-
-  let hi = sysctl_u32("hw.perflevel0.physicalcpu")?;
-  let lo = sysctl_u32(&format!("hw.perflevel{}.physicalcpu", nperflevels - 1))?;
-
   let is_legacy = ["M1", "M2", "M3", "M4", "A1"].iter().any(|x| chip_name.contains(x));
-  let (ecpu_label, pcpu_label) = if is_legacy { ("E", "P") } else { ("P", "S") };
+  let labels = if is_legacy { ("E", "P") } else if mid > 0 { ("E", "S") } else { ("P", "S") };
+  let label = |name: Option<&Option<String>>| match name?.as_deref()? {
+    "Efficiency" => Some("E"), "Performance" => Some("P"), "Super" => Some("S"), _ => None,
+  };
+  Some((lo as u8, mid as u8, hi as u8,
+    label(names.last()).unwrap_or(labels.0), label(names.first()).unwrap_or(labels.1)))
+}
 
-  Some((lo as u8, hi as u8, ecpu_label, pcpu_label))
+fn cpu_tier_counts(chip_name: &str) -> Option<(u8, u8, u8, &'static str, &'static str)> {
+  let count = sysctl_u32("hw.nperflevels")?;
+  let cores = (0..count).map(|i| sysctl_u32(&format!("hw.perflevel{i}.physicalcpu")))
+    .collect::<Option<Vec<_>>>()?;
+  let names = (0..count).map(|i| sysctl_str(&format!("hw.perflevel{i}.name"))).collect::<Vec<_>>();
+  topology_from_perflevels(&cores, &names, chip_name)
 }
 
 /// Read hardware descriptor fields via sysctl and IORegistry only (no subprocess).
@@ -677,7 +697,7 @@ pub(crate) fn hw_native() -> WithError<HwInfo> {
   let mac_model = sysctl_str("hw.model").ok_or("Failed to read mac model")?;
   let memory_gb =
     sysctl_u64("hw.memsize").ok_or("Failed to read memory size")? / (1024 * 1024 * 1024);
-  let (ecpu_cores, pcpu_cores, ecpu_label, pcpu_label) =
+  let (ecpu_cores, mcpu_cores, pcpu_cores, ecpu_label, pcpu_label) =
     cpu_tier_counts(&chip_name).ok_or("Failed to read CPU core topology")?;
 
   let mut gpu_cores = 0u8;
@@ -695,6 +715,7 @@ pub(crate) fn hw_native() -> WithError<HwInfo> {
     mac_model,
     memory_gb: memory_gb as u16,
     ecpu_cores,
+    mcpu_cores,
     pcpu_cores,
     ecpu_label: ecpu_label.into(),
     pcpu_label: pcpu_label.into(),
@@ -726,7 +747,10 @@ pub(crate) fn hw_from_profiler() -> WithError<HwInfo> {
 
   // SPHardwareDataType.0.number_processors -> "proc x:y:z" or "proc x:y:z:w"
   let number_processors = out["SPHardwareDataType"][0]["number_processors"].as_str().unwrap_or("");
-  let (ecpu_cores, pcpu_cores, has_mcpu) = parse_cpu_cores(number_processors);
+  let os_major = sysctl_str("kern.osproductversion")
+    .and_then(|s| s.split('.').next()?.parse::<u32>().ok()).unwrap_or(0);
+  let (ecpu_cores, mcpu_cores, pcpu_cores, ecpu_label, pcpu_label) =
+    profiler_topology(number_processors, os_major);
 
   // SPDisplaysDataType.0.sppci_cores
   let gpu_cores = out["SPDisplaysDataType"][0]["sppci_cores"].as_str();
@@ -737,11 +761,35 @@ pub(crate) fn hw_from_profiler() -> WithError<HwInfo> {
     mac_model,
     memory_gb: mem_gb as u16,
     ecpu_cores: ecpu_cores as u8,
+    mcpu_cores: mcpu_cores as u8,
     pcpu_cores: pcpu_cores as u8,
-    ecpu_label: if has_mcpu { "P".into() } else { "E".into() },
-    pcpu_label: if has_mcpu { "S".into() } else { "P".into() },
+    ecpu_label: ecpu_label.into(),
+    pcpu_label: pcpu_label.into(),
     gpu_cores: gpu_cores as u8,
   })
+}
+
+fn profiler_topology(s: &str, os_major: u32) -> (u64, u64, u64, &'static str, &'static str) {
+  // macOS 27 reports total:Super:Performance:Efficiency; macOS 26 used
+  // total:top:Efficiency:middle. Never interpret the new format as the old one.
+  if os_major >= 27 {
+    let parts = s.strip_prefix("proc ").unwrap_or("").split(':')
+      .map(str::parse::<u64>).collect::<Result<Vec<_>, _>>();
+    if let Ok(parts) = parts {
+      match parts.as_slice() {
+        [_, 0, p, e] => return (*e, 0, *p, "E", "P"),
+        [_, top, p, 0] => return (*p, 0, *top, "P", "S"),
+        [_, top, p, e] => return (*e, *p, *top, "E", "S"),
+        _ => {}
+      }
+    }
+  }
+  let (lo, hi, middle) = parse_cpu_cores(s);
+  (lo, 0, hi, if middle { "P" } else { "E" }, if middle { "S" } else { "P" })
+}
+
+fn is_pmgr_node(name: &str) -> bool {
+  matches!(name, "pmgr" | "pmgr-child")
 }
 
 fn load_soc_info() -> WithError<SocInfo> {
@@ -755,6 +803,7 @@ fn load_soc_info() -> WithError<SocInfo> {
     mac_model: hw.mac_model,
     memory_gb: hw.memory_gb,
     ecpu_cores: hw.ecpu_cores,
+    mcpu_cores: hw.mcpu_cores,
     pcpu_cores: hw.pcpu_cores,
     ecpu_label: hw.ecpu_label,
     pcpu_label: hw.pcpu_label,
@@ -768,19 +817,21 @@ fn load_soc_info() -> WithError<SocInfo> {
   // CPU/GPU frequencies always come from IOKit directly, regardless of how the
   // rest of the hardware descriptor above was sourced.
   for (entry, name) in IOServiceIterator::new("AppleARMIODevice")? {
-    if name == "pmgr" {
+    if is_pmgr_node(&name) {
       let item = cfio_get_props(entry, name)?;
       // 1) `strings /usr/bin/powermetrics | grep voltage-states` uses non-sram keys
       //    but their values are zero, so sram used here; it looks valid.
       // 2) sudo powermetrics --samplers cpu_power -i 1000 -n 1 | grep "active residency" | grep "Cluster"
-      if let Some(f) = cpu_freqs(item, "voltage-states1-sram", true, cpu_scale) {
+      // M6 moved the tables to pmgr-child; pmgr is an empty stub. A later
+      // stub must not replace a table already found on another node.
+      if info.ecpu_freqs.is_empty() && let Some(f) = cpu_freqs(item, "voltage-states1-sram", true, cpu_scale) {
         info.ecpu_freqs = f;
       }
-      if let Some(f) = cpu_freqs(item, "voltage-states5-sram", false, cpu_scale) {
+      if info.pcpu_freqs.is_empty() && let Some(f) = cpu_freqs(item, "voltage-states5-sram", false, cpu_scale) {
         info.pcpu_freqs = f;
       }
 
-      if let Some((_, freqs)) = get_dvfs_mhz(item, "voltage-states9") {
+      if info.gpu_freqs.is_empty() && let Some((_, freqs)) = get_dvfs_mhz(item, "voltage-states9") {
         info.gpu_freqs = to_mhz(freqs, gpu_scale);
       }
       unsafe { CFRelease(item as _) }
@@ -789,6 +840,12 @@ fn load_soc_info() -> WithError<SocInfo> {
 
   if info.ecpu_freqs.is_empty() || info.pcpu_freqs.is_empty() {
     return Err("No CPU frequencies found".into());
+  }
+
+  // M6 PACC0_MCPU and PACC0_PCPU expose the same 20 residency states of
+  // the P complex. Use its table for both, as upstream macmon does.
+  if info.mcpu_cores > 0 {
+    info.mcpu_freqs = info.pcpu_freqs.clone();
   }
 
   Ok(info)
@@ -884,36 +941,36 @@ fn cfio_channel_metadata(channels: CFDictionaryRef) -> Vec<(String, String, Stri
   metadata
 }
 
-fn cfio_get_subs(chan: CFMutableDictionaryRef) -> WithError<IOReportSubscriptionRef> {
+fn cfio_get_subs(chan: CFMutableDictionaryRef) -> WithError<(IOReportSubscriptionRef, CFMutableDictionaryRef)> {
   let mut subscribed = null_mut();
   let rs = unsafe { IOReportCreateSubscription(null(), chan, &mut subscribed, 0, null()) };
-  if !subscribed.is_null() {
-    unsafe { CFRelease(subscribed.cast()) };
-  }
-  if rs.is_null() {
+  if rs.is_null() || subscribed.is_null() {
+    unsafe {
+      if !subscribed.is_null() { CFRelease(subscribed.cast()); }
+      if !rs.is_null() { CFRelease(rs.cast()); }
+    }
     return Err("Failed to create subscription".into());
   }
 
-  Ok(rs)
+  Ok((rs, subscribed))
 }
 
 /// IOReport subscription used to sample Apple Silicon power and residency counters.
 pub struct IOReport {
   subs: IOReportSubscriptionRef,
   channels: IOReportChannels,
-  metadata: Vec<(String, String, String, String)>,
   prev: Option<(CFDictionaryRef, std::time::Instant)>,
 }
 
 impl IOReport {
   fn from_filter(filter: Option<ChannelFilterRef<'_>>) -> WithError<Self> {
-    let channels = cfio_get_chan(filter)?;
-    let metadata = cfio_channel_metadata(channels.chan);
-    let subs = cfio_get_subs(channels.chan)?;
+    let mut channels = cfio_get_chan(filter)?;
+    let (subs, subscribed) = cfio_get_subs(channels.chan)?;
+    unsafe { CFRelease(channels.chan.cast()) };
+    channels.chan = subscribed;
     Ok(Self {
       subs,
       channels,
-      metadata,
       prev: None,
     })
   }
@@ -943,7 +1000,7 @@ impl IOReport {
       let sample3 = IOReportCreateSamplesDelta(sample1, sample2, null());
       CFRelease(sample1 as _);
       CFRelease(sample2 as _);
-      IOReportIterator::new(sample3, self.metadata.clone())
+      IOReportIterator::from_sample(sample3)
     }
   }
 
@@ -970,7 +1027,7 @@ impl IOReport {
     let elapsed = next.1.duration_since(prev.1).max(Duration::from_nanos(1));
     self.prev = Some(next);
 
-    (IOReportIterator::new(diff, self.metadata.clone()), elapsed)
+    (IOReportIterator::from_sample(diff), elapsed)
   }
 
   /// Collect multiple delta samples across one sampling window.
@@ -1001,7 +1058,7 @@ impl IOReport {
       let elapsed = next.1.duration_since(prev.1).as_millis() as u64;
       prev = next;
 
-      samples.push((IOReportIterator::new(diff, self.metadata.clone()), elapsed.max(1)));
+      samples.push((IOReportIterator::from_sample(diff), elapsed.max(1)));
     }
 
     self.prev = Some(prev);
@@ -1371,6 +1428,41 @@ impl Drop for SMC {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn detects_m6_and_preserves_two_tier_macs() {
+    let names = |values: &[&str]| values.iter().map(|s| Some(s.to_string())).collect::<Vec<_>>();
+    assert_eq!(topology_from_perflevels(&[2, 4, 6], &names(&["Super", "Performance", "Efficiency"]), "Apple M6"),
+      Some((6, 4, 2, "E", "S")));
+    assert_eq!(topology_from_perflevels(&[4, 6], &names(&["Performance", "Efficiency"]), "Apple M4"),
+      Some((6, 0, 4, "E", "P")));
+    assert_eq!(topology_from_perflevels(&[4, 6], &names(&["Super", "Efficiency"]), "Apple M5"),
+      Some((6, 0, 4, "E", "S")));
+    assert_eq!(topology_from_perflevels(&[6, 12], &names(&["Super", "Performance"]), "Apple M5 Max"),
+      Some((12, 0, 6, "P", "S")));
+    assert_eq!(topology_from_perflevels(&[4, 4], &[], "Apple M1"), Some((4, 0, 4, "E", "P")));
+    assert!(topology_from_perflevels(&[], &[], "Apple M6").is_none());
+  }
+
+  #[test]
+  fn understands_profiler_format_changes() {
+    assert_eq!(profiler_topology("proc 12:2:4:6", 27), (6, 4, 2, "E", "S"));
+    assert_eq!(profiler_topology("proc 8:0:4:4", 27), (4, 0, 4, "E", "P"));
+    assert_eq!(profiler_topology("proc 18:6:12:0", 27), (12, 0, 6, "P", "S"));
+    assert_eq!(profiler_topology("proc 18:6:0:12", 26), (12, 0, 6, "P", "S"));
+    assert_eq!(profiler_topology("proc 8:4:4:0", 26), (4, 0, 4, "E", "P"));
+    assert_eq!(profiler_topology("proc 8:4:4", 15), (4, 0, 4, "E", "P"));
+  }
+
+  #[test]
+  fn discovers_old_and_new_frequency_nodes() {
+    assert!(is_pmgr_node("pmgr"));
+    assert!(is_pmgr_node("pmgr-child"));
+    assert!(!is_pmgr_node("pmgrtools"));
+    // Actual M6 table entries, stored in kHz.
+    assert_eq!(to_mhz(vec![972_000, 2_940_000], cpu_freq_scale("Apple M6")), vec![972, 2940]);
+    assert_eq!(to_mhz(vec![600_000_000], cpu_freq_scale("Apple M1")), vec![600]);
+  }
 
   #[test]
   fn parse_acc_clusters_values() {

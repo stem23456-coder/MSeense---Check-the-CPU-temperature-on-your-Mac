@@ -121,6 +121,14 @@ pub struct Metrics {
   pub ecpu_cores: Vec<CpuCoreMetrics>,
   /// Metrics for performance cores, ordered by die and core index.
   pub pcpu_cores: Vec<CpuCoreMetrics>,
+  /// Middle-tier Performance cores on three-tier chips (M6).
+  pub mcpu_cores: Vec<CpuCoreMetrics>,
+  /// Middle-tier frequency in MHz.
+  pub mcpu_freq_mhz: u32,
+  /// Middle-tier frequency-weighted active residency.
+  pub mcpu_scaled_ratio: f32,
+  /// Middle-tier active residency.
+  pub mcpu_active_ratio: f32,
   /// GPU frequency in MHz, averaged over active residency.
   pub gpu_freq_mhz: u32,
   /// GPU active residency weighted by operating frequency relative to its maximum.
@@ -168,9 +176,12 @@ fn aggregate_ioreport_metrics(mut rs: Metrics, soc: &SocInfo) -> Metrics {
   let pcpu_total_scaled: f32 = rs.pcpu_cores.iter().map(|core| core.scaled_ratio).sum();
   let ecpu_total_active: f32 = rs.ecpu_cores.iter().map(|core| core.active_ratio).sum();
   let pcpu_total_active: f32 = rs.pcpu_cores.iter().map(|core| core.active_ratio).sum();
+  let mcpu_total_scaled: f32 = rs.mcpu_cores.iter().map(|core| core.scaled_ratio).sum();
+  let mcpu_total_active: f32 = rs.mcpu_cores.iter().map(|core| core.active_ratio).sum();
   let ecores = rs.ecpu_cores.len().max(soc.ecpu_cores as usize) as f32;
   let pcores = rs.pcpu_cores.len().max(soc.pcpu_cores as usize) as f32;
-  let tcores = ecores + pcores;
+  let mcores = rs.mcpu_cores.len().max(soc.mcpu_cores as usize) as f32;
+  let tcores = ecores + mcores + pcores;
 
   let ecpu_min_frequency_mhz = soc.ecpu_freqs.first().copied().unwrap_or_default();
   let pcpu_min_frequency_mhz = soc.pcpu_freqs.first().copied().unwrap_or_default();
@@ -180,8 +191,11 @@ fn aggregate_ioreport_metrics(mut rs: Metrics, soc: &SocInfo) -> Metrics {
   rs.pcpu_freq_mhz = aggregate_frequency(&rs.pcpu_cores, pcpu_min_frequency_mhz);
   rs.pcpu_scaled_ratio = zero_div(pcpu_total_scaled, pcores);
   rs.pcpu_active_ratio = zero_div(pcpu_total_active, pcores);
-  rs.cpu_scaled_ratio = zero_div(ecpu_total_scaled + pcpu_total_scaled, tcores);
-  rs.cpu_active_ratio = zero_div(ecpu_total_active + pcpu_total_active, tcores);
+  rs.mcpu_freq_mhz = aggregate_frequency(&rs.mcpu_cores, soc.mcpu_freqs.first().copied().unwrap_or_default());
+  rs.mcpu_scaled_ratio = zero_div(mcpu_total_scaled, mcores);
+  rs.mcpu_active_ratio = zero_div(mcpu_total_active, mcores);
+  rs.cpu_scaled_ratio = zero_div(ecpu_total_scaled + mcpu_total_scaled + pcpu_total_scaled, tcores);
+  rs.cpu_active_ratio = zero_div(ecpu_total_active + mcpu_total_active + pcpu_total_active, tcores);
   rs.all_power = rs.cpu_power + rs.gpu_power + rs.ane_power;
   rs
 }
@@ -204,15 +218,20 @@ fn read_smc_numeric_u32(smc: &mut SMC, key: &str) -> Option<u32> {
 }
 
 fn calc_freq_from_residencies(items: &[(String, i64)], freqs: &[u32]) -> FreqMetrics {
-  let (len1, len2) = (items.len(), freqs.len());
-  assert!(len1 > len2, "calc_freq invalid data: {len1} vs {len2}"); // todo?
-
   // CPU layouts are [IDLE, frequencies...] or [DOWN, IDLE, frequencies...];
   // GPU uses OFF before frequency states.
-  let offset = items
+  let Some(offset) = items
     .iter()
     .position(|x| x.0 != "IDLE" && x.0 != "DOWN" && x.0 != "OFF")
-    .expect("calc_freq missing active states");
+  else { return (0, 0.0, 0.0) };
+
+  // Unknown or changed state layouts must not panic in the sampling thread.
+  if freqs.is_empty() || items.len() - offset < freqs.len()
+    || items.iter().skip(offset + freqs.len()).any(|x| x.1 > 0) || freqs.last() == Some(&0) {
+    let active = items[offset..].iter().map(|x| x.1.max(0) as f64).sum::<f64>();
+    let total = items.iter().map(|x| x.1.max(0) as f64).sum::<f64>();
+    return (0, 0.0, zero_div(active, total) as f32);
+  }
 
   let usage = items.iter().skip(offset).take(freqs.len()).map(|x| x.1 as f64).sum::<f64>();
   let total = items.iter().map(|x| x.1 as f64).sum::<f64>();
@@ -238,6 +257,7 @@ fn calc_freq(item: CFDictionaryRef, freqs: &[u32]) -> FreqMetrics {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CpuCoreKind {
   E,
+  M,
   P,
 }
 
@@ -273,7 +293,9 @@ fn cpu_core_sort_key(channel: &str) -> (usize, usize, usize) {
 fn parse_cpu_core_channel(channel: &str) -> Option<(CpuCoreKind, CpuCoreKey)> {
   let kind = if channel.contains("PCPU") {
     CpuCoreKind::P
-  } else if channel.contains("ECPU") || channel.contains("MCPU") {
+  } else if channel.contains("MCPU") {
+    CpuCoreKind::M
+  } else if channel.contains("ECPU") {
     CpuCoreKind::E
   } else {
     return None;
@@ -481,6 +503,7 @@ impl Sampler {
   ) -> WithError<Metrics> {
     let mut ecpu_map: HashMap<CpuCoreKey, FreqMetrics> = HashMap::new();
     let mut pcpu_map: HashMap<CpuCoreKey, FreqMetrics> = HashMap::new();
+    let mut mcpu_map: HashMap<CpuCoreKey, FreqMetrics> = HashMap::new();
     let mut rs = Metrics::default();
 
     // Keep this channel handling in sync with ioreport_channels_filter.
@@ -496,13 +519,22 @@ impl Sampler {
             ecpu_map.insert(key, calc_freq(x.item, &self.soc.ecpu_freqs));
             continue;
           }
+          Some((CpuCoreKind::M, key)) => {
+            if self.soc.mcpu_cores > 0 {
+              mcpu_map.insert(key, calc_freq(x.item, &self.soc.mcpu_freqs));
+            } else {
+              // M5 Pro/Max expose Performance as their lower of two tiers.
+              ecpu_map.insert(key, calc_freq(x.item, &self.soc.ecpu_freqs));
+            }
+            continue;
+          }
           None => {}
         }
       }
 
       if x.group == "GPU Stats" && x.subgroup == GPU_FREQ_DICE_SUBG {
         match x.channel.as_str() {
-          "GPUPH" => {
+          "GPUPH" if self.soc.gpu_freqs.len() > 1 => {
             let (freq, scaled_ratio, active_ratio) = calc_freq(x.item, &self.soc.gpu_freqs[1..]);
             rs.gpu_freq_mhz = freq;
             rs.gpu_scaled_ratio = scaled_ratio;
@@ -527,6 +559,7 @@ impl Sampler {
     }
 
     rs.ecpu_cores = collect_cpu_core_metrics(ecpu_map);
+    rs.mcpu_cores = collect_cpu_core_metrics(mcpu_map);
     rs.pcpu_cores = collect_cpu_core_metrics(pcpu_map);
 
     Ok(rs)
@@ -547,6 +580,8 @@ impl Sampler {
     //             Base:    PCPU* = Super, ECPU* = Efficiency
     //             Pro/Max: PCPU* = Super, MCPU* = Performance
     //           MCPU is a separate middle-tier design, not a renamed ECPU core.
+    //   M6:     EACC_ECPU = Efficiency, PACC0_MCPU = Performance,
+    //           PACC0_PCPU = Super, all three tiers present simultaneously.
     //   Ultra:  Any-generation Ultra chips prefix channels with "DIE_N_"
     //           and include cluster/core separators (e.g. "DIE_0_PCPU1_CPU0").
 
@@ -601,6 +636,35 @@ mod tests {
       pcpu_freqs: vec![1800],
       ..Default::default()
     }
+  }
+
+  #[test]
+  fn counts_all_twelve_m6_cores_in_cpu_load() {
+    let soc = SocInfo {
+      ecpu_cores: 6, mcpu_cores: 4, pcpu_cores: 2,
+      ecpu_freqs: vec![972, 2940], mcpu_freqs: vec![1440, 4788], pcpu_freqs: vec![1440, 4788],
+      ..Default::default()
+    };
+    let metrics = Metrics {
+      ecpu_cores: (0..6).map(|i| core(0, i, 972, 0.0, 0.0)).collect(),
+      mcpu_cores: (0..4).map(|i| core(0, i, 4788, 1.0, 1.0)).collect(),
+      pcpu_cores: (0..2).map(|i| core(0, i, 1440, 0.0, 0.0)).collect(),
+      ..Default::default()
+    };
+    let rs = aggregate_ioreport_metrics(metrics, &soc);
+    assert!((rs.cpu_active_ratio - 4.0 / 12.0).abs() < 0.00001);
+    assert!((rs.cpu_scaled_ratio - 4.0 / 12.0).abs() < 0.00001);
+    assert_eq!((rs.mcpu_freq_mhz, rs.mcpu_active_ratio), (4788, 1.0));
+  }
+
+  #[test]
+  fn handles_unused_gpu_states_and_unknown_frequency_layouts() {
+    let states = vec![("OFF".into(), 50), ("P1".into(), 50), ("P2".into(), 0)];
+    assert_eq!(calc_freq_from_residencies(&states, &[502]), (502, 0.5, 0.5));
+    assert_eq!(calc_freq_from_residencies(&states, &[]), (0, 0.0, 0.5));
+    assert_eq!(calc_freq_from_residencies(&[], &[502]), (0, 0.0, 0.0));
+    let missing = vec![("OFF".into(), 50), ("P1".into(), 0), ("P2".into(), 50)];
+    assert_eq!(calc_freq_from_residencies(&missing, &[502]), (0, 0.0, 0.5));
   }
 
   #[test]
@@ -707,7 +771,10 @@ mod tests {
       ("DIE_1_PCPU0", Some(CpuCoreKind::P)),
       ("ECPU7", Some(CpuCoreKind::E)),
       ("PCPU12", Some(CpuCoreKind::P)),
-      ("MCPU3", Some(CpuCoreKind::E)), // M5+ performance cores map to ecpu slot
+      ("MCPU3", Some(CpuCoreKind::M)),
+      ("EACC_ECPU5", Some(CpuCoreKind::E)),
+      ("PACC0_MCPU2", Some(CpuCoreKind::M)),
+      ("PACC0_PCPU1", Some(CpuCoreKind::P)),
       ("GPU0", None),
     ];
     for (channel, expected) in cases {

@@ -41,12 +41,12 @@ fn print_hw(profiler: &HwInfo, native: &HwInfo) {
   print_hw_row(
     "CPU",
     format!(
-      "{}{} + {}{}",
-      profiler.ecpu_cores, profiler.ecpu_label, profiler.pcpu_cores, profiler.pcpu_label
+      "{}{} + {}P + {}{}",
+      profiler.ecpu_cores, profiler.ecpu_label, profiler.mcpu_cores, profiler.pcpu_cores, profiler.pcpu_label
     ),
     format!(
-      "{}{} + {}{}",
-      native.ecpu_cores, native.ecpu_label, native.pcpu_cores, native.pcpu_label
+      "{}{} + {}P + {}{}",
+      native.ecpu_cores, native.ecpu_label, native.mcpu_cores, native.pcpu_cores, native.pcpu_label
     ),
   );
   print_hw_row(
@@ -84,7 +84,7 @@ pub fn print_debug() -> WithError<()> {
 
   print_divider("AppleARMIODevice");
   for (entry, name) in IOServiceIterator::new("AppleARMIODevice")? {
-    if name == "pmgr" {
+    if name == "pmgr" || name == "pmgr-child" {
       let item = cfio_get_props(entry, name)?;
       let mut keys = cfdict_keys(item);
       keys.sort();
