@@ -230,38 +230,31 @@ mod app {
         );
 
         println!("────────────────────────────────────────────────────────────────────────────────────");
+        if soc.mcpu_cores > 0 {
+            println!("P-tier avg: {:4} MHz / {:5.1}%", m.mcpu_freq_mhz, m.mcpu_active_ratio * 100.0);
+        }
         println!("CORE    TYPE   FREQ       LOAD(active)   CAPACITY     TEMP SENSOR*");
 
-        for (i, c) in m.ecpu_cores.iter().enumerate() {
-            let sensor = temps.low_cpu.get(i).map(|s| s.celsius);
-            println!(
-                "#{:<2}     {:>2}    {:>4} MHz    {:>6.1}%         {:>6.1}%      {}",
-                i + 1,
-                soc.ecpu_label,
-                c.freq_mhz,
-                c.active_ratio * 100.0,
-                c.scaled_ratio * 100.0,
-                optional_temp(sensor)
-            );
-        }
-
-        for (i, c) in m.pcpu_cores.iter().enumerate() {
-            let sensor = temps.high_cpu.get(i).map(|s| s.celsius);
-            println!(
-                "#{:<2}     {:>2}    {:>4} MHz    {:>6.1}%         {:>6.1}%      {}",
-                i + 1,
-                soc.pcpu_label,
-                c.freq_mhz,
-                c.active_ratio * 100.0,
-                c.scaled_ratio * 100.0,
-                optional_temp(sensor)
-            );
+        for (label, cores, sensors) in [
+            (soc.ecpu_label.as_str(), &m.ecpu_cores, temps.low_cpu.as_slice()),
+            ("P", &m.mcpu_cores, &[][..]),
+            (soc.pcpu_label.as_str(), &m.pcpu_cores, temps.high_cpu.as_slice()),
+        ] {
+            for (i, c) in cores.iter().enumerate() {
+                // Without a verified mapping, keep M6 temperatures in the raw sensor list.
+                let sensor = if soc.mcpu_cores > 0 { None } else { sensors.get(i).map(|s| s.celsius) };
+                println!(
+                    "#{:<2}     {:>2}    {:>4} MHz    {:>6.1}%         {:>6.1}%      {}",
+                    i + 1, label, c.freq_mhz, c.active_ratio * 100.0,
+                    c.scaled_ratio * 100.0, optional_temp(sensor),
+                );
+            }
         }
 
         println!("────────────────────────────────────────────────────────────────────────────────────");
         println!("RAW THERMAL SENSORS ({})", if temps.source.is_empty() { "average fallback" } else { temps.source });
-        print_sensor_group(&soc.ecpu_label, &temps.low_cpu);
-        print_sensor_group(&soc.pcpu_label, &temps.high_cpu);
+        print_sensor_group(if soc.mcpu_cores > 0 { "CPU" } else { &soc.ecpu_label }, &temps.low_cpu);
+        print_sensor_group(if soc.mcpu_cores > 0 { "CPU" } else { &soc.pcpu_label }, &temps.high_cpu);
         print_sensor_group("CPU", &temps.other_cpu);
         print_sensor_group("GPU", &temps.gpu);
 

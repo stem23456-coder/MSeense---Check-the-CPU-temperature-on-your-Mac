@@ -434,6 +434,9 @@ mod app {
         efficiency_temp_items: Vec<MenuItem>,
         performance_temp_items: Vec<MenuItem>,
         gpu_temp_item: Option<MenuItem>,
+        cpu_temp_item: Option<MenuItem>,
+        middle_cluster_item: Option<MenuItem>,
+        middle_core_items: Vec<MenuItem>,
         cpu_summary_item: Option<MenuItem>,
         efficiency_cluster_item: Option<MenuItem>,
         performance_cluster_item: Option<MenuItem>,
@@ -466,6 +469,9 @@ mod app {
                 efficiency_temp_items: Vec::new(),
                 performance_temp_items: Vec::new(),
                 gpu_temp_item: None,
+                cpu_temp_item: None,
+                middle_cluster_item: None,
+                middle_core_items: Vec::new(),
                 cpu_summary_item: None,
                 efficiency_cluster_item: None,
                 performance_cluster_item: None,
@@ -508,23 +514,21 @@ mod app {
             // Keep information rows enabled for normal readable text; menu
             // events from them are intentionally ignored in user_event().
             menu.append(&MenuItem::new("🌡  Temperatures", true, None))?;
-            for index in 0..efficiency_count {
-                let item = MenuItem::new(
-                    format!("{efficiency_name} Core {}: …", index + 1),
-                    true,
-                    None,
-                );
-                menu.append(&item)?;
-                self.efficiency_temp_items.push(item);
-            }
-            for index in 0..performance_count {
-                let item = MenuItem::new(
-                    format!("{performance_name} Core {}: …", index + 1),
-                    true,
-                    None,
-                );
-                menu.append(&item)?;
-                self.performance_temp_items.push(item);
+            let cpu_temp = MenuItem::new("CPU maximum: …", true, None);
+            menu.append(&cpu_temp)?;
+            self.cpu_temp_item = Some(cpu_temp);
+            // Only show per-core rows when this chip has a known sensor mapping.
+            // M6 currently exposes CPU sensors without a verified core association.
+            for (name, count, values, items) in [
+                (efficiency_name, efficiency_count, &snapshot.thermals.efficiency, &mut self.efficiency_temp_items),
+                (performance_name, performance_count, &snapshot.thermals.performance, &mut self.performance_temp_items),
+            ] {
+                if values.is_empty() { continue; }
+                for index in 0..count {
+                    let item = MenuItem::new(format!("{name} Core {}: …", index + 1), true, None);
+                    menu.append(&item)?;
+                    items.push(item);
+                }
             }
             let gpu_temp = MenuItem::new("GPU: …", true, None);
             menu.append(&gpu_temp)?;
@@ -533,34 +537,23 @@ mod app {
             menu.append(&PredefinedMenuItem::separator())?;
             menu.append(&MenuItem::new("Processor", true, None))?;
             let cpu_summary = MenuItem::new("CPU Total: …", true, None);
-            let efficiency_cluster =
-                MenuItem::new(format!("{efficiency_name} Cluster: …"), true, None);
-            let performance_cluster =
-                MenuItem::new(format!("{performance_name} Cluster: …"), true, None);
             menu.append(&cpu_summary)?;
-            menu.append(&efficiency_cluster)?;
-            for index in 0..efficiency_count {
-                let item = MenuItem::new(
-                    format!("{efficiency_name} Core {}: …", index + 1),
-                    true,
-                    None,
-                );
-                menu.append(&item)?;
-                self.efficiency_core_items.push(item);
-            }
-            menu.append(&performance_cluster)?;
-            for index in 0..performance_count {
-                let item = MenuItem::new(
-                    format!("{performance_name} Core {}: …", index + 1),
-                    true,
-                    None,
-                );
-                menu.append(&item)?;
-                self.performance_core_items.push(item);
-            }
             self.cpu_summary_item = Some(cpu_summary);
-            self.efficiency_cluster_item = Some(efficiency_cluster);
-            self.performance_cluster_item = Some(performance_cluster);
+            for (name, count, cluster, items) in [
+                (efficiency_name, efficiency_count, &mut self.efficiency_cluster_item, &mut self.efficiency_core_items),
+                ("Performance", self.soc.mcpu_cores as usize, &mut self.middle_cluster_item, &mut self.middle_core_items),
+                (performance_name, performance_count, &mut self.performance_cluster_item, &mut self.performance_core_items),
+            ] {
+                if count == 0 { continue; }
+                let item = MenuItem::new(format!("{name} Cluster: …"), true, None);
+                menu.append(&item)?;
+                *cluster = Some(item);
+                for index in 0..count {
+                    let item = MenuItem::new(format!("{name} Core {}: …", index + 1), true, None);
+                    menu.append(&item)?;
+                    items.push(item);
+                }
+            }
 
             menu.append(&PredefinedMenuItem::separator())?;
             menu.append(&MenuItem::new("Graphics", true, None))?;
@@ -687,6 +680,9 @@ mod app {
                     display_temp(snapshot.thermals.performance.get(index).copied()),
                 ));
             }
+            if let Some(item) = &self.cpu_temp_item {
+                item.set_text(format!("CPU maximum: {}", display_temp(cpu_max)));
+            }
             if let Some(item) = &self.gpu_temp_item {
                 item.set_text(format!("GPU: {}", display_temp(gpu_average)));
             }
@@ -699,51 +695,30 @@ mod app {
                     metrics.cpu_power,
                 ));
             }
-            if let Some(item) = &self.efficiency_cluster_item {
-                item.set_text(format!(
-                    "{efficiency_name} Cluster: {:.1}% active  ·  {:.1}% scaled  ·  {} MHz",
-                    metrics.ecpu_active_ratio * 100.0,
-                    metrics.ecpu_scaled_ratio * 100.0,
-                    metrics.ecpu_freq_mhz,
-                ));
-            }
-            if let Some(item) = &self.performance_cluster_item {
-                item.set_text(format!(
-                    "{performance_name} Cluster: {:.1}% active  ·  {:.1}% scaled  ·  {} MHz",
-                    metrics.pcpu_active_ratio * 100.0,
-                    metrics.pcpu_scaled_ratio * 100.0,
-                    metrics.pcpu_freq_mhz,
-                ));
-            }
-            for (index, item) in self.efficiency_core_items.iter().enumerate() {
-                let text = metrics.ecpu_cores.get(index).map_or_else(
-                    || format!("{efficiency_name} Core {}: unavailable", index + 1),
-                    |core| {
-                        format!(
-                            "{efficiency_name} Core {}: {:.1}% active  ·  {:.1}% scaled  ·  {} MHz",
-                            index + 1,
-                            core.active_ratio * 100.0,
-                            core.scaled_ratio * 100.0,
-                            core.freq_mhz,
-                        )
-                    },
-                );
-                item.set_text(text);
-            }
-            for (index, item) in self.performance_core_items.iter().enumerate() {
-                let text = metrics.pcpu_cores.get(index).map_or_else(
-                    || format!("{performance_name} Core {}: unavailable", index + 1),
-                    |core| {
-                        format!(
-                            "{performance_name} Core {}: {:.1}% active  ·  {:.1}% scaled  ·  {} MHz",
-                            index + 1,
-                            core.active_ratio * 100.0,
-                            core.scaled_ratio * 100.0,
-                            core.freq_mhz,
-                        )
-                    },
-                );
-                item.set_text(text);
+            for (name, cluster, items, cores, freq, active, scaled) in [
+                (efficiency_name, &self.efficiency_cluster_item, &self.efficiency_core_items,
+                 &metrics.ecpu_cores, metrics.ecpu_freq_mhz, metrics.ecpu_active_ratio, metrics.ecpu_scaled_ratio),
+                ("Performance", &self.middle_cluster_item, &self.middle_core_items,
+                 &metrics.mcpu_cores, metrics.mcpu_freq_mhz, metrics.mcpu_active_ratio, metrics.mcpu_scaled_ratio),
+                (performance_name, &self.performance_cluster_item, &self.performance_core_items,
+                 &metrics.pcpu_cores, metrics.pcpu_freq_mhz, metrics.pcpu_active_ratio, metrics.pcpu_scaled_ratio),
+            ] {
+                if let Some(item) = cluster {
+                    item.set_text(format!(
+                        "{name} Cluster: {:.1}% active  ·  {:.1}% scaled  ·  {freq} MHz",
+                        active * 100.0, scaled * 100.0,
+                    ));
+                }
+                for (index, item) in items.iter().enumerate() {
+                    let text = cores.get(index).map_or_else(
+                        || format!("{name} Core {}: unavailable", index + 1),
+                        |core| format!(
+                            "{name} Core {}: {:.1}% active  ·  {:.1}% scaled  ·  {} MHz",
+                            index + 1, core.active_ratio * 100.0, core.scaled_ratio * 100.0, core.freq_mhz,
+                        ),
+                    );
+                    item.set_text(text);
+                }
             }
 
             if let Some(item) = &self.gpu_summary_item {
