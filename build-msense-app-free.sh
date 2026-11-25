@@ -7,7 +7,7 @@ set -euo pipefail
 
 APP_NAME="${APP_NAME:-MSense}"
 BUNDLE_ID="${BUNDLE_ID:-io.github.yourname.msense}"
-VERSION="${VERSION:-0.3.0}"
+VERSION="${VERSION:-0.3.1}"
 BIN_NAME="msense-menu"
 # Optional override. If empty, the builder auto-detects AppIcon.icns or a
 # square 1024x1024 AppIcon.png next to Cargo.toml (and then in assets/).
@@ -316,7 +316,7 @@ PLIST="$STAGED_APP/Contents/Info.plist"
 /usr/bin/plutil -insert CFBundleName -string "$APP_NAME" "$PLIST"
 /usr/bin/plutil -insert CFBundlePackageType -string APPL "$PLIST"
 /usr/bin/plutil -insert CFBundleShortVersionString -string "$VERSION" "$PLIST"
-/usr/bin/plutil -insert CFBundleVersion -string 3 "$PLIST"
+/usr/bin/plutil -insert CFBundleVersion -string 4 "$PLIST"
 if [[ "$APP_ICON_INSTALLED" -eq 1 ]]; then
     /usr/bin/plutil -insert CFBundleIconFile -string AppIcon "$PLIST"
 fi

@@ -17,7 +17,7 @@ MSense keeps the most important Mac temperatures visible without taking up valua
 - Temperature for every available CPU core
 - Per-core CPU activity, scaled load, and frequency
 - GPU activity, frequency, temperature, power, and core count
-- RAM and swap usage in decimal GB, matching the units used by macOS
+- RAM and swap usage in binary GiB, matching installed memory capacity (for example, 24 GiB)
 - CPU, GPU, Neural Engine, DRAM, GPU SRAM, compute, and system power metrics
 - Cooling fan information when available
 - Compact native macOS menu-bar interface
@@ -31,12 +31,16 @@ MSense keeps the most important Mac temperatures visible without taking up valua
 
 Intel Macs are not supported.
 
-M6 compatibility was checked on Mac18,1 with macOS 27. CPU/GPU temperatures and all three CPU tiers are supported. Individual M6 temperature sensors are not assigned to physical cores without a verified mapping; the menu shows the CPU maximum and GPU average. Middle-tier frequencies use the shared P-complex table, as in upstream macmon. Some power counters are not exposed by this macOS version; a zero power reading can mean the counter is unavailable.
+M6 compatibility was checked on Mac18,1 with macOS 27. CPU/GPU temperatures and all three CPU tiers are supported. Individual M6 temperature sensors are not assigned to physical cores without a verified mapping; the menu shows the CPU maximum and GPU average. Middle-tier frequencies use the shared P-complex table, as in upstream macmon. On macOS 27, known AppleCLPC counters supply CPU/GPU/ANE/DRAM power. Unavailable counters are explicitly labeled `unavailable`; a real idle zero stays zero.
+
+### Compatibility checks
+
+The code handles M1–M6, including the known Pro/Max/Ultra layouts and M6's three CPU tiers. Regression tests cover representative core counts, frequency units, multi-die channel names and macOS 27 counter descriptors. Physical validation was performed on M4 (0.2.0) and M6 (0.3.x); this is not a claim that every Mac/OS combination has been tested. New chips or OS changes may expose fewer metrics. Missing SMC/HID sources no longer prevent the remaining readings from working.
 
 ### Installation
 
 1. Open the [Releases](../../releases) page.
-2. Download `MSense-0.3.0-macOS-arm64.dmg` using Safari, Chrome, or Firefox.
+2. Download `MSense-0.3.1-macOS-arm64.dmg` using Safari, Chrome, or Firefox.
 3. Open the DMG and drag `MSense.app` into `Applications`.
 4. Launch MSense. It runs in the menu bar, so it does not show a Dock icon or a main window.
 
@@ -105,7 +109,7 @@ MSense — лёгкая open-source утилита для мониторинга
 - Автоматическое определение ядер Efficiency, Performance и Super, включая все 12 ядер M6
 - Температура, нагрузка и частота каждого ядра
 - Нагрузка, частота, температура и энергопотребление GPU
-- Использование оперативной памяти и swap в десятичных GB, как в macOS
+- Использование оперативной памяти и swap в GiB: установленная память 24 GiB отображается как 24,00
 - Энергопотребление CPU, GPU, Neural Engine, DRAM и всей вычислительной части
 - Информация о вентиляторах, если она доступна
 - Без лишних датчиков аккумулятора, трекпада, зарядного устройства и proximity
@@ -118,12 +122,16 @@ MSense — лёгкая open-source утилита для мониторинга
 
 Компьютеры Mac с процессорами Intel не поддерживаются.
 
-Поддержка M6 проверена на Mac18,1 с macOS 27: доступны температуры CPU/GPU и все три типа ядер. Привязка отдельных температурных датчиков M6 к физическим ядрам пока не подтверждена — меню показывает максимум CPU и среднюю температуру GPU. Частоты среднего типа ядер используют общую таблицу P-комплекса, как в macmon. Часть счётчиков энергопотребления эта версия macOS не предоставляет; нулевое значение мощности может означать недоступный счётчик.
+Поддержка M6 проверена на Mac18,1 с macOS 27: доступны температуры CPU/GPU и все три типа ядер. Привязка отдельных температурных датчиков M6 к физическим ядрам пока не подтверждена — меню показывает максимум CPU и среднюю температуру GPU. Частоты среднего типа ядер используют общую таблицу P-комплекса, как в macmon. На macOS 27 мощность CPU/GPU/ANE/DRAM читается из поддерживаемых счётчиков AppleCLPC. Недоступные счётчики отмечены как `unavailable`, а реальный ноль в простое остаётся нулём.
+
+### Проверка совместимости
+
+Код учитывает M1–M6, известные схемы Pro/Max/Ultra и три типа ядер M6. Регрессионные тесты проверяют типовые конфигурации ядер, единицы частот, каналы нескольких кристаллов и счётчики macOS 27. На реальном железе проверялись M4 (0.2.0) и M6 (0.3.x); все сочетания моделей и версий macOS физически не тестировались. На новых чипах или версиях macOS часть показателей может быть недоступна. Отсутствие SMC/HID больше не мешает остальным показаниям работать.
 
 ### Установка
 
 1. Откройте страницу [Releases](../../releases).
-2. Скачайте `MSense-0.3.0-macOS-arm64.dmg` через Safari, Chrome или Firefox.
+2. Скачайте `MSense-0.3.1-macOS-arm64.dmg` через Safari, Chrome или Firefox.
 3. Откройте DMG и перетащите `MSense.app` в папку «Программы».
 4. Запустите MSense. Утилита работает в строке меню, поэтому у неё нет главного окна и значка в Dock.
 
