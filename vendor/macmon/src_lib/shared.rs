@@ -9,8 +9,13 @@ pub(crate) fn ioreport_channels_filter(
   group: &str,
   subgroup: &str,
   channel: &str,
-  _unit: &str,
+  unit: &str,
 ) -> bool {
+  if group == "CLPC" {
+    return subgroup == "Energy Counters"
+      && matches!(channel, "CPU Energy" | "GPU Energy" | "ANE" | "DRAM")
+      && matches!(unit, "mJ" | "uJ" | "nJ");
+  }
   if group == "Energy Model" {
     return channel == "GPU Energy"
       || channel.ends_with("CPU Energy")

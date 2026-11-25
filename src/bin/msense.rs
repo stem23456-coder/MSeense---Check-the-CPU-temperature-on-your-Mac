@@ -4,7 +4,12 @@ fn main() {
 }
 
 #[cfg(target_os = "macos")]
+#[path = "../formatting.rs"]
+mod formatting;
+
+#[cfg(target_os = "macos")]
 mod app {
+    use super::formatting::{gib, power};
     use macmon::{Metrics, Sampler, SocInfo};
     use macmon::sources::{IOHIDSensors, SMC};
     use std::env;
@@ -184,29 +189,29 @@ mod app {
         println!("MSense  {}  ({})", soc.chip_name, soc.mac_model);
         println!("────────────────────────────────────────────────────────────────────────────────────");
         println!(
-            "CPU {:5.1}%   hottest {}   avg {}   power {:6.2} W",
+            "CPU {:5.1}%   hottest {}   avg {}   power {:>8}",
             m.cpu_active_ratio * 100.0,
             temp(cpu_max),
             temp(m.temp.cpu_temp_avg),
-            m.cpu_power
+            power(m.cpu_power)
         );
         println!(
-            "GPU {:5.1}%   {:4} MHz   hottest {}   avg {}   power {:6.2} W   cores {}",
+            "GPU {:5.1}%   {:4} MHz   hottest {}   avg {}   power {:>8}   cores {}",
             m.gpu_active_ratio * 100.0,
             m.gpu_freq_mhz,
             temp(gpu_max),
             temp(m.temp.gpu_temp_avg),
-            m.gpu_power,
+            power(m.gpu_power),
             soc.gpu_cores
         );
         println!(
-            "POWER chip(CPU+GPU+ANE) {:6.2} W   system-estimate {}",
-            m.all_power,
-            if m.sys_power > 0.0 { format!("{:6.2} W", m.sys_power) } else { "n/a".to_string() }
+            "POWER chip(CPU+GPU+ANE) {:>8}   system-estimate {}",
+            power(m.all_power),
+            power(m.sys_power)
         );
         println!(
-            "      CPU {:6.2} W   GPU {:6.2} W   ANE {:6.2} W   DRAM {:6.2} W   GPU-SRAM {:6.2} W",
-            m.cpu_power, m.gpu_power, m.ane_power, m.ram_power, m.gpu_ram_power
+            "      CPU {}   GPU {}   ANE {}   DRAM {}   GPU-SRAM {}",
+            power(m.cpu_power), power(m.gpu_power), power(m.ane_power), power(m.ram_power), power(m.gpu_ram_power)
         );
         println!(
             "RAM {:>6.2} / {:>6.2} GiB ({:5.1}%)   SWAP {:>6.2} / {:>6.2} GiB ({:5.1}%)",
@@ -307,10 +312,6 @@ mod app {
         t.high_cpu.sort_by(|a, b| a.name.cmp(&b.name));
         t.other_cpu.sort_by(|a, b| a.name.cmp(&b.name));
         t.gpu.sort_by(|a, b| a.name.cmp(&b.name));
-    }
-
-    fn gib(bytes: u64) -> f64 {
-        bytes as f64 / 1024.0 / 1024.0 / 1024.0
     }
 
     fn pct(used: u64, total: u64) -> f64 {

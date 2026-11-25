@@ -30,7 +30,12 @@ fn main() {
 mod login_item;
 
 #[cfg(target_os = "macos")]
+#[path = "../formatting.rs"]
+mod formatting;
+
+#[cfg(target_os = "macos")]
 mod app {
+    use super::formatting::{gib, power};
     use super::login_item::LoginItem;
     use super::{
         DONATION_BTC_ADDRESS, DONATION_DIALOG_TITLE, DONATION_MENU_TITLE, DONATION_MESSAGE,
@@ -689,10 +694,10 @@ mod app {
 
             if let Some(item) = &self.cpu_summary_item {
                 item.set_text(format!(
-                    "CPU Total: {:.1}% active  ·  {:.1}% scaled  ·  {:.2} W",
+                    "CPU Total: {:.1}% active  ·  {:.1}% scaled  ·  {}",
                     metrics.cpu_active_ratio * 100.0,
                     metrics.cpu_scaled_ratio * 100.0,
-                    metrics.cpu_power,
+                    power(metrics.cpu_power),
                 ));
             }
             for (name, cluster, items, cores, freq, active, scaled) in [
@@ -731,9 +736,9 @@ mod app {
             }
             if let Some(item) = &self.gpu_detail_item {
                 item.set_text(format!(
-                    "Temperature: {}  ·  Power: {:.2} W  ·  {} cores",
+                    "Temperature: {}  ·  Power: {}  ·  {} cores",
                     display_temp(gpu_average),
-                    metrics.gpu_power,
+                    power(metrics.gpu_power),
                     self.soc.gpu_cores,
                 ));
             }
@@ -742,17 +747,17 @@ mod app {
             let swap_percent = pct(metrics.memory.swap_usage, metrics.memory.swap_total);
             if let Some(item) = &self.ram_item {
                 item.set_text(format!(
-                    "RAM: {:.2} / {:.2} GB  ({:.1}%)",
-                    gb(metrics.memory.ram_usage),
-                    gb(metrics.memory.ram_total),
+                    "RAM: {:.2} / {:.2} GiB  ({:.1}%)",
+                    gib(metrics.memory.ram_usage),
+                    gib(metrics.memory.ram_total),
                     ram_percent,
                 ));
             }
             if let Some(item) = &self.swap_item {
                 item.set_text(format!(
-                    "Swap: {:.2} / {:.2} GB  ({:.1}%)",
-                    gb(metrics.memory.swap_usage),
-                    gb(metrics.memory.swap_total),
+                    "Swap: {:.2} / {:.2} GiB  ({:.1}%)",
+                    gib(metrics.memory.swap_usage),
+                    gib(metrics.memory.swap_total),
                     swap_percent,
                 ));
             }
@@ -763,13 +768,7 @@ mod app {
             set_power(&self.ram_power_item, "DRAM", metrics.ram_power);
             set_power(&self.gpu_ram_power_item, "GPU SRAM", metrics.gpu_ram_power);
             set_power(&self.compute_power_item, "Compute Total", metrics.all_power);
-            if let Some(item) = &self.system_power_item {
-                if metrics.sys_power > 0.0 {
-                    item.set_text(format!("System Total: {:.2} W", metrics.sys_power));
-                } else {
-                    item.set_text("System Total: unavailable");
-                }
-            }
+            set_power(&self.system_power_item, "System Total", metrics.sys_power);
 
             for (item, fan) in self.fan_items.iter().zip(metrics.fans.iter()) {
                 match fan.max_rpm {
@@ -885,9 +884,9 @@ end run
         });
     }
 
-    fn set_power(item: &Option<MenuItem>, label: &str, watts: f32) {
+    fn set_power(item: &Option<MenuItem>, label: &str, watts: Option<f32>) {
         if let Some(item) = item {
-            item.set_text(format!("{label}: {watts:.2} W"));
+            item.set_text(format!("{label}: {}", power(watts)));
         }
     }
 
@@ -941,11 +940,6 @@ end run
         value
             .filter(|value| valid_temp(*value))
             .map_or(-1, |value| value.round() as i16)
-    }
-
-    // Match macOS Activity Monitor: decimal gigabytes, not binary gibibytes.
-    fn gb(bytes: u64) -> f64 {
-        bytes as f64 / 1_000_000_000.0
     }
 
     fn pct(used: u64, total: u64) -> f64 {
