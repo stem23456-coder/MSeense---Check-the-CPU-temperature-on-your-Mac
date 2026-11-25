@@ -17,8 +17,8 @@
 //!   loop {
 //!     let metrics = sampler.get_metrics(1000)?;
 //!
-//!     println!("CPU power: {:.2} W", metrics.cpu_power);
-//!     println!("GPU power: {:.2} W", metrics.gpu_power);
+//!     println!("CPU power: {:?} W", metrics.cpu_power);
+//!     println!("GPU power: {:?} W", metrics.gpu_power);
 //!     println!("CPU frequency-scaled ratio: {:.1}%", metrics.cpu_scaled_ratio * 100.0);
 //!     println!("CPU active residency: {:.1}%", metrics.cpu_active_ratio * 100.0);
 //!     println!("E-CPU frequency: {} MHz", metrics.ecpu_freq_mhz);
@@ -58,7 +58,7 @@
 //!
 //!   loop {
 //!     match metrics.try_recv() {
-//!       Ok(metrics) => println!("CPU power: {:.2} W", metrics.cpu_power),
+//!       Ok(metrics) => println!("CPU power: {:?} W", metrics.cpu_power),
 //!       Err(TryRecvError::Empty) => {}
 //!       Err(TryRecvError::Disconnected) => break,
 //!     }
@@ -74,6 +74,7 @@ pub mod diagnostics;
 #[doc(hidden)]
 pub mod metrics;
 mod shared;
+mod clpc;
 pub mod sources;
 
 // Re-export the commonly used types.
