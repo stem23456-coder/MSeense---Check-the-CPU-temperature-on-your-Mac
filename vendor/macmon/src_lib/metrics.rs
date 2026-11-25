@@ -101,9 +101,10 @@ struct SmcSensors {
 /// Scaled ratios weight active-state residency by operating frequency relative
 /// to the hardware maximum. Active ratios count all active-state residency
 /// equally, regardless of frequency. Both are in the `0.0..=1.0` range.
-/// CPU cluster frequencies use the arithmetic mean of per-core frequencies
-/// with a minimum-frequency floor. Per-core and GPU frequencies are averaged
-/// over active residency.
+/// CPU cluster frequencies average the cores with measured active residency.
+/// A frequency of zero means no active frequency was measured. Unavailable
+/// residency ratios are NaN, including incomplete CPU aggregates.
+/// Per-core and GPU frequencies are averaged over active residency.
 /// Power values are reported in Watts.
 ///
 /// This struct may gain new metrics in future releases. When constructing it
@@ -185,37 +186,41 @@ fn fan_rpm_value(val: f32) -> Option<u32> {
   if is_valid_fan_rpm(val) { Some(val.trunc() as u32) } else { None }
 }
 
-fn aggregate_frequency(cores: &[CpuCoreMetrics], min_frequency_mhz: u32) -> u32 {
-  let average =
-    zero_div(cores.iter().map(|core| core.freq_mhz as f64).sum::<f64>(), cores.len() as f64);
-  average.max(min_frequency_mhz as f64) as u32
+fn cluster_metrics(cores: &[CpuCoreMetrics], expected: u8) -> FreqMetrics {
+  if cores.is_empty() || cores.len() < usize::from(expected) {
+    return (0, f32::NAN, f32::NAN);
+  }
+  let scaled = cores.iter().map(|core| core.scaled_ratio).sum::<f32>() / cores.len() as f32;
+  let active = cores.iter().map(|core| core.active_ratio).sum::<f32>() / cores.len() as f32;
+  let (sum, count) = cores.iter().filter(|core| core.freq_mhz > 0)
+    .fold((0u64, 0u64), |(sum, count), core| (sum + u64::from(core.freq_mhz), count + 1));
+  let freq = if scaled.is_finite() { sum.checked_div(count).unwrap_or(0) as u32 } else { 0 };
+  (freq, scaled, active)
 }
 
 fn aggregate_ioreport_metrics(mut rs: Metrics, soc: &SocInfo) -> Metrics {
-  let ecpu_total_scaled: f32 = rs.ecpu_cores.iter().map(|core| core.scaled_ratio).sum();
-  let pcpu_total_scaled: f32 = rs.pcpu_cores.iter().map(|core| core.scaled_ratio).sum();
-  let ecpu_total_active: f32 = rs.ecpu_cores.iter().map(|core| core.active_ratio).sum();
-  let pcpu_total_active: f32 = rs.pcpu_cores.iter().map(|core| core.active_ratio).sum();
-  let mcpu_total_scaled: f32 = rs.mcpu_cores.iter().map(|core| core.scaled_ratio).sum();
-  let mcpu_total_active: f32 = rs.mcpu_cores.iter().map(|core| core.active_ratio).sum();
-  let ecores = rs.ecpu_cores.len().max(soc.ecpu_cores as usize) as f32;
-  let pcores = rs.pcpu_cores.len().max(soc.pcpu_cores as usize) as f32;
-  let mcores = rs.mcpu_cores.len().max(soc.mcpu_cores as usize) as f32;
-  let tcores = ecores + mcores + pcores;
+  (rs.ecpu_freq_mhz, rs.ecpu_scaled_ratio, rs.ecpu_active_ratio) = cluster_metrics(&rs.ecpu_cores, soc.ecpu_cores);
+  (rs.pcpu_freq_mhz, rs.pcpu_scaled_ratio, rs.pcpu_active_ratio) = cluster_metrics(&rs.pcpu_cores, soc.pcpu_cores);
+  (rs.mcpu_freq_mhz, rs.mcpu_scaled_ratio, rs.mcpu_active_ratio) = cluster_metrics(&rs.mcpu_cores, soc.mcpu_cores);
 
-  let ecpu_min_frequency_mhz = soc.ecpu_freqs.first().copied().unwrap_or_default();
-  let pcpu_min_frequency_mhz = soc.pcpu_freqs.first().copied().unwrap_or_default();
-  rs.ecpu_freq_mhz = aggregate_frequency(&rs.ecpu_cores, ecpu_min_frequency_mhz);
-  rs.ecpu_scaled_ratio = zero_div(ecpu_total_scaled, ecores);
-  rs.ecpu_active_ratio = zero_div(ecpu_total_active, ecores);
-  rs.pcpu_freq_mhz = aggregate_frequency(&rs.pcpu_cores, pcpu_min_frequency_mhz);
-  rs.pcpu_scaled_ratio = zero_div(pcpu_total_scaled, pcores);
-  rs.pcpu_active_ratio = zero_div(pcpu_total_active, pcores);
-  rs.mcpu_freq_mhz = aggregate_frequency(&rs.mcpu_cores, soc.mcpu_freqs.first().copied().unwrap_or_default());
-  rs.mcpu_scaled_ratio = zero_div(mcpu_total_scaled, mcores);
-  rs.mcpu_active_ratio = zero_div(mcpu_total_active, mcores);
-  rs.cpu_scaled_ratio = zero_div(ecpu_total_scaled + mcpu_total_scaled + pcpu_total_scaled, tcores);
-  rs.cpu_active_ratio = zero_div(ecpu_total_active + mcpu_total_active + pcpu_total_active, tcores);
+  let clusters = [
+    (rs.ecpu_cores.len(), soc.ecpu_cores, rs.ecpu_scaled_ratio, rs.ecpu_active_ratio),
+    (rs.mcpu_cores.len(), soc.mcpu_cores, rs.mcpu_scaled_ratio, rs.mcpu_active_ratio),
+    (rs.pcpu_cores.len(), soc.pcpu_cores, rs.pcpu_scaled_ratio, rs.pcpu_active_ratio),
+  ];
+  let mut scaled = 0.0;
+  let mut active = 0.0;
+  let mut total = 0.0;
+  for (sampled, expected, scaled_ratio, active_ratio) in clusters {
+    let count = sampled.max(usize::from(expected)) as f32;
+    if count > 0.0 {
+      scaled += scaled_ratio * count;
+      active += active_ratio * count;
+      total += count;
+    }
+  }
+  rs.cpu_scaled_ratio = scaled / total;
+  rs.cpu_active_ratio = active / total;
   rs.all_power = [rs.cpu_power, rs.gpu_power, rs.ane_power].into_iter().sum();
   rs
 }
@@ -240,22 +245,20 @@ fn read_smc_numeric_u32(smc: &mut SMC, key: &str) -> Option<u32> {
 fn calc_freq_from_residencies(items: &[(String, i64)], freqs: &[u32]) -> FreqMetrics {
   // CPU layouts are [IDLE, frequencies...] or [DOWN, IDLE, frequencies...];
   // GPU uses OFF before frequency states.
-  let Some(offset) = items
-    .iter()
-    .position(|x| x.0 != "IDLE" && x.0 != "DOWN" && x.0 != "OFF")
+  let total = items.iter().map(|x| x.1 as f64).sum::<f64>();
+  if total <= 0.0 || items.iter().any(|x| x.1 < 0) {
+    return (0, f32::NAN, f32::NAN);
+  }
+  let Some(offset) = items.iter().position(|x| !matches!(x.0.as_str(), "IDLE" | "DOWN" | "OFF"))
   else { return (0, 0.0, 0.0) };
-
-  // Unknown or changed state layouts must not panic in the sampling thread.
+  let usage = items[offset..].iter().map(|x| x.1 as f64).sum::<f64>();
+  if usage == 0.0 {
+    return (0, 0.0, 0.0);
+  }
   if freqs.is_empty() || items.len() - offset < freqs.len()
     || items.iter().skip(offset + freqs.len()).any(|x| x.1 > 0) || freqs.last() == Some(&0) {
-    let active = items[offset..].iter().map(|x| x.1.max(0) as f64).sum::<f64>();
-    let total = items.iter().map(|x| x.1.max(0) as f64).sum::<f64>();
-    return (0, 0.0, zero_div(active, total) as f32);
+    return (0, f32::NAN, (usage / total) as f32);
   }
-
-  let usage = items.iter().skip(offset).take(freqs.len()).map(|x| x.1 as f64).sum::<f64>();
-  let total = items.iter().map(|x| x.1 as f64).sum::<f64>();
-
   let mut avg_freq = 0f64;
   for i in 0..freqs.len() {
     let percent = zero_div(items[i + offset].1 as _, usage);
@@ -532,7 +535,7 @@ impl Sampler {
     let mut ecpu_map: HashMap<CpuCoreKey, FreqMetrics> = HashMap::new();
     let mut pcpu_map: HashMap<CpuCoreKey, FreqMetrics> = HashMap::new();
     let mut mcpu_map: HashMap<CpuCoreKey, FreqMetrics> = HashMap::new();
-    let mut rs = Metrics::default();
+    let mut rs = Metrics { gpu_active_ratio: f32::NAN, gpu_scaled_ratio: f32::NAN, ..Metrics::default() };
     let mut cpu = PowerSources::default();
     let mut gpu = PowerSources::default();
     let mut ane = PowerSources::default();
@@ -566,8 +569,8 @@ impl Sampler {
 
       if x.group == "GPU Stats" && x.subgroup == GPU_FREQ_DICE_SUBG {
         match x.channel.as_str() {
-          "GPUPH" if self.soc.gpu_freqs.len() > 1 => {
-            let (freq, scaled_ratio, active_ratio) = calc_freq(x.item, &self.soc.gpu_freqs[1..]);
+          "GPUPH" => {
+            let (freq, scaled_ratio, active_ratio) = calc_freq(x.item, self.soc.gpu_freqs.get(1..).unwrap_or_default());
             rs.gpu_freq_mhz = freq;
             rs.gpu_scaled_ratio = scaled_ratio;
             rs.gpu_active_ratio = active_ratio;
@@ -631,7 +634,7 @@ impl Sampler {
     //           and include cluster/core separators (e.g. "DIE_0_PCPU1_CPU0").
 
     let duration = Duration::from_millis(duration as u64);
-    let (sample, elapsed) = self.ior.get_sample_interval(duration);
+    let (sample, elapsed) = self.ior.get_sample_interval(duration)?;
     let mut rs = aggregate_ioreport_metrics(self.get_ioreport_metrics(sample, elapsed)?, &self.soc);
 
     rs.memory = self.get_mem()?;
@@ -727,10 +730,12 @@ mod tests {
   fn handles_unused_gpu_states_and_unknown_frequency_layouts() {
     let states = vec![("OFF".into(), 50), ("P1".into(), 50), ("P2".into(), 0)];
     assert_eq!(calc_freq_from_residencies(&states, &[502]), (502, 0.5, 0.5));
-    assert_eq!(calc_freq_from_residencies(&states, &[]), (0, 0.0, 0.5));
-    assert_eq!(calc_freq_from_residencies(&[], &[502]), (0, 0.0, 0.0));
+    assert!(calc_freq_from_residencies(&states, &[]).1.is_nan());
+    assert!(calc_freq_from_residencies(&[], &[502]).2.is_nan());
     let missing = vec![("OFF".into(), 50), ("P1".into(), 0), ("P2".into(), 50)];
-    assert_eq!(calc_freq_from_residencies(&missing, &[502]), (0, 0.0, 0.5));
+    let (freq, scaled, active) = calc_freq_from_residencies(&missing, &[502]);
+    assert_eq!((freq, active), (0, 0.5));
+    assert!(scaled.is_nan());
   }
 
   #[test]
@@ -752,22 +757,22 @@ mod tests {
         ane_power: Some(0.5),
         ..Default::default()
       },
-      &soc_info(2, 1),
+      &soc_info(1, 2),
     );
 
     assert_eq!(rs.ecpu_freq_mhz, 2000);
-    assert_eq!(rs.ecpu_scaled_ratio, 0.5);
-    assert_eq!(rs.ecpu_active_ratio, 0.5);
-    assert_eq!(rs.pcpu_freq_mhz, 2000);
+    assert_eq!(rs.ecpu_scaled_ratio, 1.0);
+    assert_eq!(rs.ecpu_active_ratio, 1.0);
+    assert_eq!(rs.pcpu_freq_mhz, 4000);
     assert_eq!(rs.pcpu_scaled_ratio, 0.5);
     assert_eq!(rs.pcpu_active_ratio, 0.5);
-    assert_eq!(rs.cpu_scaled_ratio, 0.5);
-    assert_eq!(rs.cpu_active_ratio, 0.5);
+    assert_eq!(rs.cpu_scaled_ratio, 2.0/3.0);
+    assert_eq!(rs.cpu_active_ratio, 2.0/3.0);
     assert_eq!(rs.all_power, Some(4.0));
   }
 
   #[test]
-  fn frequency_uses_minimum_floor_when_cluster_is_idle() {
+  fn idle_cluster_has_no_measured_active_frequency() {
     let rs = aggregate_ioreport_metrics(
       Metrics {
         ecpu_cores: vec![core(0, 0, 0, 0.0, 0.0), core(0, 1, 0, 0.0, 0.0)],
@@ -777,8 +782,19 @@ mod tests {
       &soc_info(0, 0),
     );
 
-    assert_eq!(rs.ecpu_freq_mhz, 800);
-    assert_eq!(rs.pcpu_freq_mhz, 1800);
+    assert_eq!(rs.ecpu_freq_mhz, 0);
+    assert_eq!(rs.pcpu_freq_mhz, 0);
+  }
+
+  #[test]
+  fn missing_core_prevents_a_whole_cpu_reading() {
+    let rs = aggregate_ioreport_metrics(
+      Metrics { ecpu_cores: vec![core(0, 0, 2000, 0.5, 0.5)], ..Default::default() },
+      &soc_info(2, 1),
+    );
+    assert!(rs.cpu_active_ratio.is_nan() && rs.cpu_scaled_ratio.is_nan());
+    assert!(rs.ecpu_active_ratio.is_nan() && rs.pcpu_active_ratio.is_nan());
+    assert_eq!(rs.ecpu_freq_mhz, 0);
   }
 
   #[test]
