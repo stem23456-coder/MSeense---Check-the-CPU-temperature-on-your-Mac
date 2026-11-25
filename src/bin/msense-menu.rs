@@ -34,8 +34,12 @@ mod login_item;
 mod formatting;
 
 #[cfg(target_os = "macos")]
+#[path = "../thermals.rs"]
+mod thermals;
+
+#[cfg(target_os = "macos")]
 mod app {
-    use super::formatting::{gib, power};
+    use super::formatting::{activity, frequency, gib, power};
     use super::login_item::LoginItem;
     use super::{
         DONATION_BTC_ADDRESS, DONATION_DIALOG_TITLE, DONATION_MENU_TITLE, DONATION_MESSAGE,
@@ -43,8 +47,8 @@ mod app {
         PERFORMANCE_CORE_COUNT_OVERRIDE,
     };
     use macmon::{Metrics, Sampler, SocInfo};
-    use macmon::sources::{IOHIDSensors, SMC};
-    use std::{collections::HashSet, process::Command, sync::{Arc, Mutex}, thread};
+    use super::thermals::{average, hottest, valid_temp, TemperatureReader, ThermalSnapshot};
+    use std::{process::Command, sync::{Arc, Mutex}, thread};
     use tray_icon::{
         Icon, TrayIcon, TrayIconBuilder, TrayIconEvent,
         menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem},
@@ -55,34 +59,10 @@ mod app {
         platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS},
     };
 
-    #[derive(Debug, Default)]
-    struct Thermals {
-        efficiency: Vec<f32>,
-        performance: Vec<f32>,
-        other_cpu: Vec<f32>,
-        gpu: Vec<f32>,
-    }
-
-    impl Thermals {
-        fn cpu_max(&self) -> Option<f32> {
-            self.efficiency
-                .iter()
-                .chain(self.performance.iter())
-                .chain(self.other_cpu.iter())
-                .copied()
-                .filter(|value| valid_temp(*value))
-                .max_by(|a, b| a.total_cmp(b))
-        }
-
-        fn gpu_average(&self) -> Option<f32> {
-            average_temp(&self.gpu)
-        }
-    }
-
     #[derive(Debug)]
     struct Snapshot {
         metrics: Metrics,
-        thermals: Thermals,
+        thermals: ThermalSnapshot,
     }
 
     #[derive(Debug)]
@@ -104,8 +84,6 @@ mod app {
 
         let sensor_chip = soc.chip_name.clone();
         let sensor_low_label = soc.ecpu_label.clone();
-        let sensor_soc_efficiency_count = soc.ecpu_cores as usize;
-        let sensor_soc_performance_count = soc.pcpu_cores as usize;
         let metrics_proxy = proxy.clone();
         // Only the most recent reading is useful when the menu event loop resumes.
         let latest = Arc::new(Mutex::new(None));
@@ -123,21 +101,7 @@ mod app {
             loop {
                 match sampler.get_metrics(1000) {
                     Ok(metrics) => {
-                        let efficiency_count = configured_core_count(
-                            EFFICIENCY_CORE_COUNT_OVERRIDE,
-                            sensor_soc_efficiency_count,
-                            metrics.ecpu_cores.len(),
-                        );
-                        let performance_count = configured_core_count(
-                            PERFORMANCE_CORE_COUNT_OVERRIDE,
-                            sensor_soc_performance_count,
-                            metrics.pcpu_cores.len(),
-                        );
-                        let snapshot = Snapshot {
-                            metrics,
-                            thermals: temperature_reader
-                                .read(efficiency_count, performance_count),
-                        };
+                        let snapshot = Snapshot { metrics, thermals: temperature_reader.read() };
                         let needs_wakeup = worker_latest.lock().unwrap().replace(snapshot).is_none();
                         if needs_wakeup && metrics_proxy.send_event(UserEvent::MetricsReady).is_err() {
                             break;
@@ -163,281 +127,11 @@ mod app {
         Ok(())
     }
 
-    struct TemperatureReader {
-        hid: Option<IOHIDSensors>,
-        smc: Option<SmcTemperatureReader>,
-    }
-
-    impl TemperatureReader {
-        fn new(chip_name: &str, low_label: &str) -> Self {
-            Self {
-                hid: IOHIDSensors::new().ok(),
-                smc: SmcTemperatureReader::new(chip_name, low_label),
-            }
-        }
-
-        fn read(&mut self, efficiency_count: usize, performance_count: usize) -> Thermals {
-            let mut result = self
-                .hid
-                .as_ref()
-                .map(read_hid_temperatures)
-                .unwrap_or_default();
-
-            if let Some(smc) = &mut self.smc {
-                let fallback = smc.read();
-                result.efficiency = choose_core_temperatures(
-                    result.efficiency,
-                    fallback.efficiency,
-                    efficiency_count,
-                );
-                result.performance = choose_core_temperatures(
-                    result.performance,
-                    fallback.performance,
-                    performance_count,
-                );
-                if result.gpu.is_empty() {
-                    result.gpu = fallback.gpu;
-                }
-                result.other_cpu.extend(fallback.other_cpu);
-            } else {
-                result.efficiency =
-                    fit_temperatures_to_cores(result.efficiency, efficiency_count);
-                result.performance =
-                    fit_temperatures_to_cores(result.performance, performance_count);
-            }
-
-            result
-        }
-    }
-
-    struct SmcTemperatureReader {
-        smc: SMC,
-        efficiency_keys: Vec<String>,
-        performance_keys: Vec<String>,
-        other_cpu_keys: Vec<String>,
-        gpu_keys: Vec<String>,
-    }
-
-    impl SmcTemperatureReader {
-        fn new(chip_name: &str, low_label: &str) -> Option<Self> {
-            let mut smc = SMC::new().ok()?;
-            let available: HashSet<String> = smc.read_all_keys().ok()?.into_iter().collect();
-            let (efficiency_candidates, performance_candidates, gpu_candidates) =
-                smc_sensor_candidates(chip_name, low_label);
-
-            let efficiency_keys = present_keys(&available, efficiency_candidates);
-            let performance_keys = present_keys(&available, performance_candidates);
-            let mut gpu_keys = present_keys(&available, gpu_candidates);
-
-            let other_cpu_keys = if efficiency_keys.is_empty() && performance_keys.is_empty() {
-                let mut keys: Vec<_> = available
-                    .iter()
-                    .filter(|key| {
-                        key.starts_with("Tp")
-                            || key.starts_with("Te")
-                            || key.starts_with("Ts")
-                    })
-                    .cloned()
-                    .collect();
-                keys.sort();
-                keys
-            } else {
-                Vec::new()
-            };
-
-            if gpu_keys.is_empty() {
-                gpu_keys = available
-                    .iter()
-                    .filter(|key| key.starts_with("Tg"))
-                    .cloned()
-                    .collect();
-                gpu_keys.sort();
-            }
-
-            Some(Self {
-                smc,
-                efficiency_keys,
-                performance_keys,
-                other_cpu_keys,
-                gpu_keys,
-            })
-        }
-
-        fn read(&mut self) -> Thermals {
-            Thermals {
-                efficiency: read_smc_values(&mut self.smc, &self.efficiency_keys),
-                performance: read_smc_values(&mut self.smc, &self.performance_keys),
-                other_cpu: read_smc_values(&mut self.smc, &self.other_cpu_keys),
-                gpu: read_smc_values(&mut self.smc, &self.gpu_keys),
-            }
-        }
-    }
-
-    fn read_hid_temperatures(hid: &IOHIDSensors) -> Thermals {
-        let mut efficiency = Vec::new();
-        let mut performance = Vec::new();
-        let mut gpu = Vec::new();
-
-        for (name, value) in hid.get_metrics() {
-            if !valid_temp(value) {
-                continue;
-            }
-            let normalized = name.to_ascii_lowercase();
-            if normalized.starts_with("eacc mtr temp sensor") {
-                efficiency.push((name, value));
-            } else if normalized.starts_with("pacc mtr temp sensor") {
-                performance.push((name, value));
-            } else if normalized.starts_with("gpu mtr temp sensor") {
-                gpu.push((name, value));
-            }
-        }
-
-        Thermals {
-            efficiency: sorted_sensor_values(efficiency),
-            performance: sorted_sensor_values(performance),
-            other_cpu: Vec::new(),
-            gpu: sorted_sensor_values(gpu),
-        }
-    }
-
-    fn sorted_sensor_values(mut values: Vec<(String, f32)>) -> Vec<f32> {
-        values.sort_by(|a, b| {
-            sensor_number(&a.0)
-                .cmp(&sensor_number(&b.0))
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        values.into_iter().map(|(_, value)| value).collect()
-    }
-
-    fn sensor_number(name: &str) -> Option<u32> {
-        let digits_reversed: String = name
-            .chars()
-            .rev()
-            .skip_while(|character| !character.is_ascii_digit())
-            .take_while(|character| character.is_ascii_digit())
-            .collect();
-        if digits_reversed.is_empty() {
-            None
-        } else {
-            digits_reversed.chars().rev().collect::<String>().parse().ok()
-        }
-    }
-
-    fn choose_core_temperatures(
-        primary: Vec<f32>,
-        fallback: Vec<f32>,
-        core_count: usize,
-    ) -> Vec<f32> {
-        let values = if core_count > 0 && primary.len() == core_count {
-            primary
-        } else if core_count > 0 && fallback.len() == core_count {
-            fallback
-        } else if !primary.is_empty() {
-            primary
-        } else {
-            fallback
-        };
-        fit_temperatures_to_cores(values, core_count)
-    }
-
-    // Apple exposes thermal sensor channels, and their number is not guaranteed
-    // to match the number of physical CPU cores. Normalize those channels to the
-    // real topology: use the hottest channel when several cover one core, and
-    // reuse the nearest cluster channel when one sensor covers multiple cores.
-    fn fit_temperatures_to_cores(values: Vec<f32>, core_count: usize) -> Vec<f32> {
-        if values.is_empty() || core_count == 0 || values.len() == core_count {
-            return values;
-        }
-
-        if values.len() < core_count {
-            return (0..core_count)
-                .map(|index| values[index * values.len() / core_count])
-                .collect();
-        }
-
-        (0..core_count)
-            .filter_map(|index| {
-                let start = index * values.len() / core_count;
-                let end = ((index + 1) * values.len() / core_count).max(start + 1);
-                values[start..end]
-                    .iter()
-                    .copied()
-                    .filter(|value| valid_temp(*value))
-                    .max_by(|a, b| a.total_cmp(b))
-            })
-            .collect()
-    }
-
-    fn present_keys(available: &HashSet<String>, candidates: &[&str]) -> Vec<String> {
-        candidates
-            .iter()
-            .filter(|key| available.contains(**key))
-            .map(|key| (*key).to_string())
-            .collect()
-    }
-
-    fn read_smc_values(smc: &mut SMC, keys: &[String]) -> Vec<f32> {
-        keys.iter()
-            .filter_map(|key| smc.read_float_val(key).ok())
-            .filter(|value| valid_temp(*value))
-            .collect()
-    }
-
-    fn smc_sensor_candidates(
-        chip_name: &str,
-        low_label: &str,
-    ) -> (&'static [&'static str], &'static [&'static str], &'static [&'static str]) {
-        const M1_E: &[&str] = &["Tp09", "Tp0T"];
-        const M1_P: &[&str] = &["Tp01", "Tp05", "Tp0D", "Tp0H", "Tp0L", "Tp0P", "Tp0X", "Tp0b"];
-        const M1_G: &[&str] = &["Tg05", "Tg0D", "Tg0L", "Tg0T"];
-
-        const M2_E: &[&str] = &["Tp1h", "Tp1t", "Tp1p", "Tp1l"];
-        const M2_P: &[&str] = &["Tp01", "Tp05", "Tp09", "Tp0D", "Tp0X", "Tp0b", "Tp0f", "Tp0j"];
-        const M2_G: &[&str] = &["Tg0f", "Tg0j"];
-
-        const M3_E: &[&str] = &["Te05", "Te0L", "Te0P", "Te0S"];
-        const M3_P: &[&str] = &[
-            "Tf04", "Tf09", "Tf0A", "Tf0B", "Tf0D", "Tf0E",
-            "Tf44", "Tf49", "Tf4A", "Tf4B", "Tf4D", "Tf4E",
-        ];
-        const M3_G: &[&str] = &["Tf14", "Tf18", "Tf19", "Tf1A", "Tf24", "Tf28", "Tf29", "Tf2A"];
-
-        const M4_E: &[&str] = &["Te05", "Te0S", "Te09", "Te0H"];
-        const M4_P: &[&str] = &["Tp01", "Tp05", "Tp09", "Tp0D", "Tp0V", "Tp0Y", "Tp0b", "Tp0e"];
-        const M4_G: &[&str] = &["Tg0G", "Tg0H", "Tg1U", "Tg1k", "Tg0K", "Tg0L", "Tg0d", "Tg0e", "Tg0j", "Tg0k"];
-
-        const M5_P: &[&str] = &[
-            "Tp0O", "Tp0R", "Tp0U", "Tp0X", "Tp0a", "Tp0d",
-            "Tp0g", "Tp0j", "Tp0m", "Tp0p", "Tp0u", "Tp0y",
-        ];
-        const M5_S: &[&str] = &["Tp00", "Tp04", "Tp08", "Tp0C", "Tp0G", "Tp0K"];
-        const M5_G: &[&str] = &["Tg0U", "Tg0X", "Tg0d", "Tg0g", "Tg0j", "Tg1Y", "Tg1c", "Tg1g"];
-        const NONE: &[&str] = &[];
-
-        if chip_name.contains("M1") {
-            (M1_E, M1_P, M1_G)
-        } else if chip_name.contains("M2") {
-            (M2_E, M2_P, M2_G)
-        } else if chip_name.contains("M3") {
-            (M3_E, M3_P, M3_G)
-        } else if chip_name.contains("M4") {
-            (M4_E, M4_P, M4_G)
-        } else if chip_name.contains("M5") && low_label == "P" {
-            (M5_P, M5_S, M5_G)
-        } else if chip_name.contains("M5") {
-            (NONE, M5_S, M5_G)
-        } else {
-            (NONE, NONE, NONE)
-        }
-    }
-
     struct MenuBarApp {
         soc: SocInfo,
         latest: Arc<Mutex<Option<Snapshot>>>,
         login: Option<LoginItem>,
         tray: Option<TrayIcon>,
-        efficiency_temp_items: Vec<MenuItem>,
-        performance_temp_items: Vec<MenuItem>,
         gpu_temp_item: Option<MenuItem>,
         cpu_temp_item: Option<MenuItem>,
         middle_cluster_item: Option<MenuItem>,
@@ -458,7 +152,7 @@ mod app {
         gpu_ram_power_item: Option<MenuItem>,
         compute_power_item: Option<MenuItem>,
         system_power_item: Option<MenuItem>,
-        fan_items: Vec<MenuItem>,
+        fan_item: Option<MenuItem>,
         donation_id: Option<MenuId>,
         quit_id: Option<MenuId>,
         last_status: Option<(i16, i16)>,
@@ -471,8 +165,6 @@ mod app {
                 latest,
                 login: None,
                 tray: None,
-                efficiency_temp_items: Vec::new(),
-                performance_temp_items: Vec::new(),
                 gpu_temp_item: None,
                 cpu_temp_item: None,
                 middle_cluster_item: None,
@@ -493,7 +185,7 @@ mod app {
                 gpu_ram_power_item: None,
                 compute_power_item: None,
                 system_power_item: None,
-                fan_items: Vec::new(),
+                fan_item: None,
                 donation_id: None,
                 quit_id: None,
                 last_status: None,
@@ -522,19 +214,6 @@ mod app {
             let cpu_temp = MenuItem::new("CPU maximum: …", true, None);
             menu.append(&cpu_temp)?;
             self.cpu_temp_item = Some(cpu_temp);
-            // Only show per-core rows when this chip has a known sensor mapping.
-            // M6 currently exposes CPU sensors without a verified core association.
-            for (name, count, values, items) in [
-                (efficiency_name, efficiency_count, &snapshot.thermals.efficiency, &mut self.efficiency_temp_items),
-                (performance_name, performance_count, &snapshot.thermals.performance, &mut self.performance_temp_items),
-            ] {
-                if values.is_empty() { continue; }
-                for index in 0..count {
-                    let item = MenuItem::new(format!("{name} Core {}: …", index + 1), true, None);
-                    menu.append(&item)?;
-                    items.push(item);
-                }
-            }
             let gpu_temp = MenuItem::new("GPU: …", true, None);
             menu.append(&gpu_temp)?;
             self.gpu_temp_item = Some(gpu_temp);
@@ -606,15 +285,10 @@ mod app {
             self.compute_power_item = Some(compute_power);
             self.system_power_item = Some(system_power);
 
-            if !snapshot.metrics.fans.is_empty() {
-                menu.append(&PredefinedMenuItem::separator())?;
-                menu.append(&MenuItem::new("Cooling", true, None))?;
-                for (index, _) in snapshot.metrics.fans.iter().enumerate() {
-                    let item = MenuItem::new(format!("Fan {}: …", index + 1), true, None);
-                    menu.append(&item)?;
-                    self.fan_items.push(item);
-                }
-            }
+            menu.append(&PredefinedMenuItem::separator())?;
+            let cooling = MenuItem::new("Cooling: …", true, None);
+            menu.append(&cooling)?;
+            self.fan_item = Some(cooling);
 
             menu.append(&PredefinedMenuItem::separator())?;
             let donation = MenuItem::new(DONATION_MENU_TITLE, true, None);
@@ -624,8 +298,8 @@ mod app {
             menu.append(&donation)?;
             menu.append(&quit)?;
 
-            let cpu_max = cpu_max_temperature(snapshot);
-            let gpu_average = gpu_temperature(snapshot);
+            let cpu_max = hottest(&snapshot.thermals.cpu);
+            let gpu_average = average(&snapshot.thermals.gpu);
             let tray = TrayIconBuilder::new()
                 .with_icon(status_icon(cpu_max, gpu_average))
                 .with_icon_as_template(true)
@@ -645,8 +319,8 @@ mod app {
                 login.refresh();
             }
             let metrics = &snapshot.metrics;
-            let cpu_max = cpu_max_temperature(snapshot);
-            let gpu_average = gpu_temperature(snapshot);
+            let cpu_max = hottest(&snapshot.thermals.cpu);
+            let gpu_average = average(&snapshot.thermals.gpu);
             let status = (rounded_temp(cpu_max), rounded_temp(gpu_average));
 
             if self.last_status != Some(status) {
@@ -671,20 +345,6 @@ mod app {
             let efficiency_name = tier_name(&self.soc.ecpu_label);
             let performance_name = tier_name(&self.soc.pcpu_label);
 
-            for (index, item) in self.efficiency_temp_items.iter().enumerate() {
-                item.set_text(format!(
-                    "{efficiency_name} Core {}: {}",
-                    index + 1,
-                    display_temp(snapshot.thermals.efficiency.get(index).copied()),
-                ));
-            }
-            for (index, item) in self.performance_temp_items.iter().enumerate() {
-                item.set_text(format!(
-                    "{performance_name} Core {}: {}",
-                    index + 1,
-                    display_temp(snapshot.thermals.performance.get(index).copied()),
-                ));
-            }
             if let Some(item) = &self.cpu_temp_item {
                 item.set_text(format!("CPU maximum: {}", display_temp(cpu_max)));
             }
@@ -694,9 +354,9 @@ mod app {
 
             if let Some(item) = &self.cpu_summary_item {
                 item.set_text(format!(
-                    "CPU Total: {:.1}% active  ·  {:.1}% scaled  ·  {}",
-                    metrics.cpu_active_ratio * 100.0,
-                    metrics.cpu_scaled_ratio * 100.0,
+                    "CPU Total: {} active  ·  {} scaled  ·  {}",
+                    activity(metrics.cpu_active_ratio),
+                    activity(metrics.cpu_scaled_ratio),
                     power(metrics.cpu_power),
                 ));
             }
@@ -710,16 +370,19 @@ mod app {
             ] {
                 if let Some(item) = cluster {
                     item.set_text(format!(
-                        "{name} Cluster: {:.1}% active  ·  {:.1}% scaled  ·  {freq} MHz",
-                        active * 100.0, scaled * 100.0,
+                        "{name} Cluster: {} active  ·  {} scaled  ·  {}",
+                        activity(active), activity(scaled), frequency(freq),
                     ));
                 }
+                // The row numbers represent a complete ordered tier. A missing
+                // channel could otherwise shift every following value by one.
+                let cores = if cores.len() == items.len() { cores.as_slice() } else { &[] };
                 for (index, item) in items.iter().enumerate() {
                     let text = cores.get(index).map_or_else(
                         || format!("{name} Core {}: unavailable", index + 1),
                         |core| format!(
-                            "{name} Core {}: {:.1}% active  ·  {:.1}% scaled  ·  {} MHz",
-                            index + 1, core.active_ratio * 100.0, core.scaled_ratio * 100.0, core.freq_mhz,
+                            "{name} Core {}: {} active  ·  {} scaled  ·  {}",
+                            index + 1, activity(core.active_ratio), activity(core.scaled_ratio), frequency(core.freq_mhz),
                         ),
                     );
                     item.set_text(text);
@@ -728,10 +391,10 @@ mod app {
 
             if let Some(item) = &self.gpu_summary_item {
                 item.set_text(format!(
-                    "GPU: {:.1}% active  ·  {:.1}% scaled  ·  {} MHz",
-                    metrics.gpu_active_ratio * 100.0,
-                    metrics.gpu_scaled_ratio * 100.0,
-                    metrics.gpu_freq_mhz,
+                    "GPU: {} active  ·  {} scaled  ·  {}",
+                    activity(metrics.gpu_active_ratio),
+                    activity(metrics.gpu_scaled_ratio),
+                    frequency(metrics.gpu_freq_mhz),
                 ));
             }
             if let Some(item) = &self.gpu_detail_item {
@@ -770,14 +433,8 @@ mod app {
             set_power(&self.compute_power_item, "Compute Total", metrics.all_power);
             set_power(&self.system_power_item, "System Total", metrics.sys_power);
 
-            for (item, fan) in self.fan_items.iter().zip(metrics.fans.iter()) {
-                match fan.max_rpm {
-                    Some(max_rpm) => item.set_text(format!(
-                        "{}: {} RPM  ·  max {} RPM",
-                        fan.name, fan.rpm, max_rpm,
-                    )),
-                    None => item.set_text(format!("{}: {} RPM", fan.name, fan.rpm)),
-                }
+            if let Some(item) = &self.fan_item {
+                item.set_text(cooling_text(&metrics.fans));
             }
         }
     }
@@ -829,6 +486,32 @@ mod app {
             _window_id: winit::window::WindowId,
             _event: winit::event::WindowEvent,
         ) {
+        }
+    }
+
+    fn cooling_text(fans: &[macmon::FanMetric]) -> String {
+        if fans.is_empty() {
+            return "Cooling: unavailable".into();
+        }
+        fans.iter().map(|fan| match fan.max_rpm {
+            Some(max) => format!("{}: {} RPM (max {max})", fan.name, fan.rpm),
+            None => format!("{}: {} RPM", fan.name, fan.rpm),
+        }).collect::<Vec<_>>().join("  ·  ")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn cooling_tracks_only_current_fans_including_stopped_fans() {
+            let samples = [
+                macmon::FanMetric { name: "fan0".into(), rpm: 0, max_rpm: None },
+                macmon::FanMetric { name: "fan1".into(), rpm: 1300, max_rpm: Some(4200) },
+            ];
+            assert_eq!(cooling_text(&[]), "Cooling: unavailable");
+            assert_eq!(cooling_text(&samples), "fan0: 0 RPM  ·  fan1: 1300 RPM (max 4200)");
+            assert_eq!(cooling_text(&samples[1..]), "fan1: 1300 RPM (max 4200)");
         }
     }
 
@@ -897,37 +580,6 @@ end run
             "S" => "Super",
             _ => "CPU",
         }
-    }
-
-    fn cpu_max_temperature(snapshot: &Snapshot) -> Option<f32> {
-        snapshot
-            .thermals
-            .cpu_max()
-            .or_else(|| valid_temp(snapshot.metrics.temp.cpu_temp_avg).then_some(snapshot.metrics.temp.cpu_temp_avg))
-    }
-
-    fn gpu_temperature(snapshot: &Snapshot) -> Option<f32> {
-        snapshot
-            .thermals
-            .gpu_average()
-            .or_else(|| valid_temp(snapshot.metrics.temp.gpu_temp_avg).then_some(snapshot.metrics.temp.gpu_temp_avg))
-    }
-
-    fn average_temp(values: &[f32]) -> Option<f32> {
-        let valid: Vec<_> = values
-            .iter()
-            .copied()
-            .filter(|value| valid_temp(*value))
-            .collect();
-        if valid.is_empty() {
-            None
-        } else {
-            Some(valid.iter().sum::<f32>() / valid.len() as f32)
-        }
-    }
-
-    fn valid_temp(value: f32) -> bool {
-        value.is_finite() && value > 0.0 && value <= 150.0
     }
 
     fn display_temp(value: Option<f32>) -> String {

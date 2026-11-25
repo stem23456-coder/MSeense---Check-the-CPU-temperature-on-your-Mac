@@ -310,34 +310,7 @@ impl Iterator for IOServiceIterator {
 // MARK: IOReportIterator
 
 /// Iterator over IOReport channel samples.
-pub struct IOReportIterator {
-  sample: CFDictionaryRef,
-  index: isize,
-  items: CFArrayRef,
-  items_size: isize,
-  metadata: Vec<(String, String, String, String)>,
-}
-
-impl IOReportIterator {
-  fn from_sample(data: CFDictionaryRef) -> Self {
-    // Subscriptions can omit channels and samples can reorder them on newer
-    // macOS releases. Metadata must describe the sample, not the request.
-    Self::new(data, cfio_channel_metadata(data))
-  }
-  /// Create an iterator from raw IOReport sample data and channel metadata.
-  pub fn new(data: CFDictionaryRef, metadata: Vec<(String, String, String, String)>) -> Self {
-    let items = cfdict_get_val(data, "IOReportChannels").unwrap() as CFArrayRef;
-    let items_size = unsafe { CFArrayGetCount(items) } as isize;
-    debug_assert_eq!(metadata.len(), items_size as usize);
-    Self { sample: data, items, items_size, index: 0, metadata }
-  }
-}
-
-impl Drop for IOReportIterator {
-  fn drop(&mut self) {
-    unsafe { CFRelease(self.sample as _) };
-  }
-}
+pub type IOReportIterator = std::vec::IntoIter<IOReportIteratorItem>;
 
 #[derive(Debug)]
 /// One IOReport channel item returned by [`IOReportIterator`].
@@ -350,32 +323,57 @@ pub struct IOReportIteratorItem {
   pub channel: String,
   /// IOReport unit label.
   pub unit: String,
-  /// Raw IOReport channel dictionary for advanced parsing.
+  /// Channel dictionary, valid while this item is alive.
   pub item: CFDictionaryRef,
+  _owner: CFDictionary,
 }
 
-impl Iterator for IOReportIterator {
-  type Item = IOReportIteratorItem;
+// Only called with Create-rule IOReport results.
+unsafe fn take_sample(raw: CFDictionaryRef) -> WithError<CFDictionary> {
+  if raw.is_null() { return Err("IOReport returned no sample".into()); }
+  Ok(unsafe { CFDictionary::wrap_under_create_rule(raw) })
+}
 
-  fn next(&mut self) -> Option<Self::Item> {
-    if self.index >= self.items_size {
-      return None;
-    }
+fn channel_array(sample: CFDictionaryRef) -> WithError<CFArray> {
+  let raw = cfdict_get_val(sample, "IOReportChannels")
+    .ok_or("IOReport sample has no channels array")?;
+  unsafe { CFType::wrap_under_get_rule(raw) }.downcast_into::<CFArray>()
+    .ok_or_else(|| "IOReport channels is not an array".into())
+}
 
-    let item = unsafe { CFArrayGetValueAtIndex(self.items, self.index) } as CFDictionaryRef;
-    let (group, subgroup, channel, unit) =
-      self.metadata.get(self.index as usize).cloned().unwrap_or_default();
-
-    self.index += 1;
-    Some(IOReportIteratorItem { group, subgroup, channel, unit, item })
+fn parse_sample(sample: CFDictionary) -> WithError<IOReportIterator> {
+  let channels = channel_array(sample.as_concrete_TypeRef())?;
+  let mut result = Vec::with_capacity(channels.len() as usize);
+  // The sample can omit or reorder channels relative to the subscription.
+  for raw in channels.iter() {
+    let owner = unsafe { CFType::wrap_under_get_rule(*raw) }.downcast_into::<CFDictionary>()
+      .ok_or("IOReport channel is not a dictionary")?;
+    let item = owner.as_concrete_TypeRef();
+    result.push(IOReportIteratorItem {
+      group: cfio_get_group(item),
+      subgroup: cfio_get_subgroup(item),
+      channel: cfio_get_channel(item),
+      unit: from_cfstr(unsafe { IOReportChannelGetUnitLabel(item) }).trim().to_string(),
+      item,
+      _owner: owner,
+    });
   }
+  Ok(result.into_iter())
 }
 
 // MARK: RAM
 
+// HOST_VM_INFO64 includes speculative pages in free_count. File-backed
+// pages already include them, so subtract only the remaining free pages.
+fn used_ram_bytes(total: u64, free: u32, speculative: u32, external: u32, page_size: u64) -> u64 {
+  let available_pages = u64::from(free.saturating_sub(speculative)) + u64::from(external);
+  total.saturating_sub(available_pages.saturating_mul(page_size))
+}
+
 /// Read used and total RAM in bytes via libc/mach APIs.
 pub fn libc_ram() -> WithError<(u64, u64)> {
-  let (mut usage, mut total) = (0u64, 0u64);
+  let mut total = 0u64;
+  let usage;
 
   unsafe {
     let mut name = [libc::CTL_HW, libc::HW_MEMSIZE];
@@ -414,16 +412,11 @@ pub fn libc_ram() -> WithError<(u64, u64)> {
       return Err("Failed to get memory stats".into());
     }
 
-    let page_size_kb = libc::sysconf(libc::_SC_PAGESIZE) as u64;
-
-    usage = (stats.active_count as u64
-      + stats.inactive_count as u64
-      + stats.wire_count as u64
-      + stats.speculative_count as u64
-      + stats.compressor_page_count as u64
-      - stats.purgeable_count as u64
-      - stats.external_page_count as u64)
-      * page_size_kb;
+    let page_size = libc::sysconf(libc::_SC_PAGESIZE);
+    if page_size <= 0 {
+      return Err("Failed to get VM page size".into());
+    }
+    usage = used_ram_bytes(total, stats.free_count, stats.speculative_count, stats.external_page_count, page_size as u64);
   }
 
   Ok((usage, total))
@@ -957,21 +950,32 @@ fn cfio_append_clpc_channels(
 fn cfio_get_chan(filter: Option<ChannelFilterRef<'_>>, include_clpc: bool) -> WithError<IOReportChannels> {
   let all_channels = unsafe { IOReportCopyAllChannels(0, 0) };
   if all_channels.is_null() { return Err("Failed to copy IOReport channels".into()); }
-  let Some(channel_array) = cfdict_get_val(all_channels, "IOReportChannels") else {
-    unsafe { CFRelease(all_channels as _) };
-    return Err("Failed to get channels".into());
+  let channel_array = match channel_array(all_channels) {
+    Ok(array) => array,
+    Err(error) => {
+      unsafe { CFRelease(all_channels.cast()) };
+      return Err(error);
+    }
   };
-  let channel_array = channel_array as CFArrayRef;
-
   let size = unsafe { CFDictionaryGetCount(all_channels) };
   let chan = unsafe { CFDictionaryCreateMutableCopy(kCFAllocatorDefault, size, all_channels) };
+  if chan.is_null() {
+    unsafe { CFRelease(all_channels.cast()) };
+    return Err("Failed to copy IOReport channel dictionary".into());
+  }
 
-  let count = unsafe { CFArrayGetCount(channel_array) };
+  let count = channel_array.len();
   let selected = unsafe { CFArrayCreateMutable(kCFAllocatorDefault, count, &kCFTypeArrayCallBacks) };
+  if selected.is_null() {
+    unsafe { CFRelease(chan.cast()); CFRelease(all_channels.cast()); }
+    return Err("Failed to allocate IOReport channel array".into());
+  }
   // Own every Create/Copy result before discovery of optional extra channels.
   let channels = IOReportChannels { chan, source: Some(all_channels), selected: Some(selected) };
-  for i in 0..count {
-    let item = unsafe { CFArrayGetValueAtIndex(channel_array, i) } as CFDictionaryRef;
+  for raw in channel_array.iter() {
+    let owner = unsafe { CFType::wrap_under_get_rule(*raw) }.downcast_into::<CFDictionary>()
+      .ok_or("IOReport channel is not a dictionary")?;
+    let item = owner.as_concrete_TypeRef();
     let group = cfio_get_group(item);
     let subgroup = cfio_get_subgroup(item);
     let channel = cfio_get_channel(item);
@@ -984,27 +988,6 @@ fn cfio_get_chan(filter: Option<ChannelFilterRef<'_>>, include_clpc: bool) -> Wi
   let key = CFString::new("IOReportChannels");
   unsafe { CFDictionarySetValue(chan, key.as_CFTypeRef(), selected as _) };
   Ok(channels)
-}
-
-fn cfio_channel_metadata(channels: CFDictionaryRef) -> Vec<(String, String, String, String)> {
-  let Some(channel_array) = cfdict_get_val(channels, "IOReportChannels") else {
-    return Vec::new();
-  };
-  let channel_array = channel_array as CFArrayRef;
-  let count = unsafe { CFArrayGetCount(channel_array) };
-  let mut metadata = Vec::with_capacity(count as usize);
-
-  for i in 0..count {
-    let item = unsafe { CFArrayGetValueAtIndex(channel_array, i) } as CFDictionaryRef;
-    metadata.push((
-      cfio_get_group(item),
-      cfio_get_subgroup(item),
-      cfio_get_channel(item),
-      from_cfstr(unsafe { IOReportChannelGetUnitLabel(item) }).trim().to_string(),
-    ));
-  }
-
-  metadata
 }
 
 fn cfio_get_subs(chan: CFMutableDictionaryRef) -> WithError<(IOReportSubscriptionRef, CFMutableDictionaryRef)> {
@@ -1025,7 +1008,7 @@ fn cfio_get_subs(chan: CFMutableDictionaryRef) -> WithError<(IOReportSubscriptio
 pub struct IOReport {
   subs: IOReportSubscriptionRef,
   channels: IOReportChannels,
-  prev: Option<(CFDictionaryRef, std::time::Instant)>,
+  prev: Option<(CFDictionary, std::time::Instant)>,
 }
 
 impl IOReport {
@@ -1059,89 +1042,62 @@ impl IOReport {
   }
 
   /// Collect one delta sample over `duration` milliseconds.
-  pub fn get_sample(&self, duration: u64) -> IOReportIterator {
-    unsafe {
-      let sample1 = IOReportCreateSamples(self.subs, self.channels.chan, null());
-      std::thread::sleep(std::time::Duration::from_millis(duration));
-      let sample2 = IOReportCreateSamples(self.subs, self.channels.chan, null());
-
-      let sample3 = IOReportCreateSamplesDelta(sample1, sample2, null());
-      CFRelease(sample1 as _);
-      CFRelease(sample2 as _);
-      IOReportIterator::from_sample(sample3)
-    }
+  pub fn get_sample(&self, duration: u64) -> WithError<IOReportIterator> {
+    let (first, _) = self.raw_sample()?;
+    std::thread::sleep(Duration::from_millis(duration));
+    let (last, _) = self.raw_sample()?;
+    Self::delta(&first, &last)
   }
 
-  fn raw_sample(&self) -> (CFDictionaryRef, std::time::Instant) {
-    (unsafe { IOReportCreateSamples(self.subs, self.channels.chan, null()) }, std::time::Instant::now())
+  fn raw_sample(&self) -> WithError<(CFDictionary, std::time::Instant)> {
+    let sample = unsafe { take_sample(IOReportCreateSamples(self.subs, self.channels.chan, null()))? };
+    Ok((sample, std::time::Instant::now()))
   }
 
-  pub(crate) fn get_sample_interval(&mut self, duration: Duration) -> (IOReportIterator, Duration) {
-    let prev = match self.prev {
-      Some(x) => x,
-      None => self.raw_sample(),
+  fn delta(first: &CFDictionary, last: &CFDictionary) -> WithError<IOReportIterator> {
+    let raw = unsafe { IOReportCreateSamplesDelta(first.as_concrete_TypeRef(), last.as_concrete_TypeRef(), null()) };
+    parse_sample(unsafe { take_sample(raw)? })
+  }
+
+  pub(crate) fn get_sample_interval(&mut self, duration: Duration) -> WithError<(IOReportIterator, Duration)> {
+    let prev = match self.prev.take() {
+      Some(sample) => sample,
+      None => self.raw_sample()?,
     };
-
-    let target_at = prev.1 + duration;
-    let now = std::time::Instant::now();
-    if target_at > now {
-      std::thread::sleep(target_at.duration_since(now));
-    }
-
-    let next = self.raw_sample();
-    let diff = unsafe { IOReportCreateSamplesDelta(prev.0, next.0, null()) };
-    unsafe { CFRelease(prev.0 as _) };
-
+    std::thread::sleep(duration.saturating_sub(prev.1.elapsed()));
+    let next = self.raw_sample()?;
     let elapsed = next.1.duration_since(prev.1).max(Duration::from_nanos(1));
+    let sample = Self::delta(&prev.0, &next.0)?;
     self.prev = Some(next);
-
-    (IOReportIterator::from_sample(diff), elapsed)
+    Ok((sample, elapsed))
   }
 
   /// Collect multiple delta samples across one sampling window.
-  pub fn get_samples(&mut self, duration: u64, count: usize) -> Vec<(IOReportIterator, u64)> {
+  pub fn get_samples(&mut self, duration: u64, count: usize) -> WithError<Vec<(IOReportIterator, u64)>> {
     let count = count.clamp(1, 32);
-    let mut samples: Vec<(IOReportIterator, u64)> = Vec::with_capacity(count);
-
-    let mut prev = match self.prev {
-      Some(x) => x,
-      None => self.raw_sample(),
+    let mut samples = Vec::with_capacity(count);
+    let mut prev = match self.prev.take() {
+      Some(sample) => sample,
+      None => self.raw_sample()?,
     };
-
     let started_at = prev.1;
     for i in 1..=count {
-      // Keep the requested sampling window stable: IOReportCreateSamples time should not
-      // accumulate as drift on top of the caller's interval.
-      let target_msec = duration.saturating_mul(i as u64) / count as u64;
-      let target_at = started_at + std::time::Duration::from_millis(target_msec);
-      let now = std::time::Instant::now();
-      if target_at > now {
-        std::thread::sleep(target_at.duration_since(now));
-      }
-
-      let next = self.raw_sample();
-      let diff = unsafe { IOReportCreateSamplesDelta(prev.0, next.0, null()) };
-      unsafe { CFRelease(prev.0 as _) };
-
+      let target = Duration::from_millis(duration.saturating_mul(i as u64) / count as u64);
+      std::thread::sleep(target.saturating_sub(started_at.elapsed()));
+      let next = self.raw_sample()?;
+      let sample = Self::delta(&prev.0, &next.0)?;
       let elapsed = next.1.duration_since(prev.1).as_millis() as u64;
+      samples.push((sample, elapsed.max(1)));
       prev = next;
-
-      samples.push((IOReportIterator::from_sample(diff), elapsed.max(1)));
     }
-
     self.prev = Some(prev);
-    samples
+    Ok(samples)
   }
 }
 
 impl Drop for IOReport {
   fn drop(&mut self) {
-    unsafe {
-      CFRelease(self.subs as _);
-      if let Some(prev) = self.prev {
-        CFRelease(prev.0 as _);
-      }
-    }
+    unsafe { CFRelease(self.subs as _) };
   }
 }
 
@@ -1337,6 +1293,12 @@ pub struct SensorVal {
   pub data: Vec<u8>,
 }
 
+fn decode_smc_value(name: String, info: &KeyInfo, bytes: &[u8]) -> WithError<SensorVal> {
+  let data = bytes.get(..info.data_size as usize).ok_or("SMC value exceeds response buffer")?;
+  let unit = std::str::from_utf8(&info.data_type.to_be_bytes())?.to_owned();
+  Ok(SensorVal { name, unit, data: data.to_vec() })
+}
+
 // MARK: SMC
 
 #[allow(clippy::upper_case_acronyms)]
@@ -1361,6 +1323,9 @@ impl SMC {
       }
     }
 
+    if conn == 0 {
+      return Err("AppleSMCKeysEndpoint unavailable".into());
+    }
     Ok(Self { conn, keys: HashMap::new() })
   }
 
@@ -1379,6 +1344,9 @@ impl SMC {
       return Err(format!("IOConnectCallStructMethod: {}", rs).into());
     }
 
+    if olen < std::mem::offset_of!(KeyData, result) + 1 {
+      return Err("Truncated SMC response".into());
+    }
     if oval.result == 132 {
       return Err("SMC key not found".into());
     }
@@ -1387,6 +1355,12 @@ impl SMC {
       return Err(format!("SMC error: {}", oval.result).into());
     }
 
+    if input.data8 == 5 {
+      let size = input.key_info.data_size as usize;
+      if size > oval.bytes.len() || olen < std::mem::offset_of!(KeyData, bytes) + size {
+        return Err("Invalid SMC response payload length".into());
+      }
+    }
     Ok(oval)
   }
 
@@ -1414,7 +1388,7 @@ impl SMC {
   pub fn key_by_index(&self, index: u32) -> WithError<String> {
     let ival = KeyData { data8: 8, data32: index, ..Default::default() };
     let oval = self.read(&ival)?;
-    Ok(std::str::from_utf8(&oval.key.to_be_bytes()).unwrap().to_string())
+    Ok(std::str::from_utf8(&oval.key.to_be_bytes())?.to_owned())
   }
 
   /// Read metadata for a four-byte SMC key.
@@ -1431,11 +1405,7 @@ impl SMC {
     let ival = KeyData { data8: 5, key, key_info, ..Default::default() };
     let oval = self.read(&ival)?;
 
-    Ok(SensorVal {
-      name,
-      unit: std::str::from_utf8(&key_info.data_type.to_be_bytes()).unwrap().to_string(),
-      data: oval.bytes[0..key_info.data_size as usize].to_vec(),
-    })
+    decode_smc_value(name, &key_info, &oval.bytes)
   }
 
   /// Read a four-byte float SMC value.
@@ -1498,6 +1468,26 @@ mod tests {
   use super::*;
 
   #[test]
+  fn malformed_smc_metadata_returns_an_error() {
+    let mut info = KeyInfo { data_type: u32::from_be_bytes(*b"flt "), data_size: 33, ..Default::default() };
+    let bytes = [0; 32];
+    assert!(decode_smc_value("F0Ac".into(), &info, &bytes).is_err());
+    info.data_size = 4;
+    info.data_type = 0xff00_ffff;
+    assert!(decode_smc_value("F0Ac".into(), &info, &bytes).is_err());
+  }
+
+  #[test]
+  fn used_ram_excludes_free_and_file_backed_pages_without_double_counting() {
+    // Of 30 free pages, 10 are speculative and also in the 40 file-backed pages.
+    for size in [4096, 16384] {
+      assert_eq!(used_ram_bytes(100 * size, 30, 10, 40, size), 40 * size);
+      assert_eq!(used_ram_bytes(100 * size, 0, 0, 0, size), 100 * size);
+      assert_eq!(used_ram_bytes(100 * size, 100, 0, 20, size), 0);
+    }
+  }
+
+  #[test]
   fn clpc_descriptors_preserve_driver_counter_ids_and_energy_units() {
     let driver = 0x1_0000_0428;
     let channels = crate::clpc::energy_channels("com.apple.driver.AppleT8152CLPC", "27.2").unwrap();
@@ -1511,6 +1501,21 @@ mod tests {
       assert_eq!(cfio_get_channel(item), name);
       assert_eq!(from_cfstr(unsafe { IOReportChannelGetUnitLabel(item) }).trim(), unit);
     }
+  }
+
+  #[test]
+  fn missing_or_malformed_ioreport_samples_return_errors() {
+    assert!(unsafe { take_sample(null()) }.is_err());
+    let wrong_type = CFString::new("unexpected");
+    for key in ["another key", "IOReportChannels"] {
+      let sample = CFDictionary::from_CFType_pairs(&[(CFString::new(key), wrong_type.clone())]);
+      let before = sample.retain_count();
+      assert!(parse_sample(sample.clone().into_untyped()).is_err());
+      assert_eq!(sample.retain_count(), before);
+    }
+    let channels = CFArray::from_CFTypes(&[wrong_type]);
+    let sample = CFDictionary::from_CFType_pairs(&[(CFString::new("IOReportChannels"), channels)]);
+    assert!(parse_sample(sample.into_untyped()).is_err());
   }
 
   #[test]
@@ -1533,11 +1538,8 @@ mod tests {
         CFString::new("IOReportChannels"),
         CFArray::from_CFTypes(&channels),
       )]);
-      let data = sample.as_concrete_TypeRef();
-      // The iterator takes ownership of one retained reference to the sample.
-      unsafe { core_foundation::base::CFRetain(data as _) };
-      let actual: Vec<_> =
-        IOReportIterator::from_sample(data).map(|item| (item.channel, item.unit)).collect();
+      let actual: Vec<_> = parse_sample(sample.into_untyped()).unwrap()
+        .map(|item| (item.channel, item.unit)).collect();
       let expected: Vec<_> =
         order.iter().map(|&i| (channel_ids[i].1.to_string(), "nJ".to_string())).collect();
       assert_eq!(actual, expected);
