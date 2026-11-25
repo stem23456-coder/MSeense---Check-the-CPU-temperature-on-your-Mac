@@ -1,6 +1,6 @@
 [package]
 name = "msense"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 description = "Apple Silicon CPU/GPU/RAM monitor with CLI and macOS menu bar app"
 license = "MIT"
