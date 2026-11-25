@@ -8,16 +8,16 @@ Lightweight, open-source Apple Silicon hardware monitor for the macOS menu bar, 
 
 ## English
 
-MSense keeps the most important Mac temperatures visible without taking up valuable menu-bar space. The compact status icon displays two stacked values: the maximum CPU core temperature on top and the GPU temperature below. Click it to open detailed live hardware metrics.
+MSense keeps the most important Mac temperatures visible without taking up valuable menu-bar space. The compact status icon displays two stacked values: the highest available CPU sensor temperature on top and the average GPU sensor temperature below. Click it to open detailed live hardware metrics.
 
 ### Features
 
-- Maximum CPU core and GPU temperatures directly in the menu bar
+- Maximum CPU sensor and average GPU sensor temperature in the menu bar
 - Automatic detection of Efficiency, Performance, and Super core counts (including all 12 cores of M6)
-- Temperature for every available CPU core
+- Individual temperature sensor readings by hardware name in the CLI
 - Per-core CPU activity, scaled load, and frequency
 - GPU activity, frequency, temperature, power, and core count
-- RAM and swap usage in binary GiB, matching installed memory capacity (for example, 24 GiB)
+- Used RAM follows Activity Monitor’s Memory Used accounting. RAM and swap are shown in GiB.
 - CPU, GPU, Neural Engine, DRAM, GPU SRAM, compute, and system power metrics
 - Cooling fan information when available
 - Compact native macOS menu-bar interface
@@ -31,7 +31,7 @@ MSense keeps the most important Mac temperatures visible without taking up valua
 
 Intel Macs are not supported.
 
-M6 compatibility was checked on Mac18,1 with macOS 27. CPU/GPU temperatures and all three CPU tiers are supported. Individual M6 temperature sensors are not assigned to physical cores without a verified mapping; the menu shows the CPU maximum and GPU average. Middle-tier frequencies use the shared P-complex table, as in upstream macmon. On macOS 27, known AppleCLPC counters supply CPU/GPU/ANE/DRAM power. Unavailable counters are explicitly labeled `unavailable`; a real idle zero stays zero.
+M6 compatibility was checked on Mac18,1 with macOS 27. CPU/GPU temperatures and all three CPU tiers are supported. Middle-tier frequencies use the shared P-complex table, as in upstream macmon. On macOS 27, known AppleCLPC counters supply CPU/GPU/ANE/DRAM power. Unavailable counters are explicitly labeled `unavailable`; a real idle zero stays zero.
 
 ### Compatibility checks
 
@@ -40,7 +40,7 @@ The code handles M1–M6, including the known Pro/Max/Ultra layouts and M6's thr
 ### Installation
 
 1. Open the [Releases](../../releases) page.
-2. Download `MSense-0.3.1-macOS-arm64.dmg` using Safari, Chrome, or Firefox.
+2. Download `MSense-0.3.2-macOS-arm64.dmg` using Safari, Chrome, or Firefox.
 3. Open the DMG and drag `MSense.app` into `Applications`.
 4. Launch MSense. It runs in the menu bar, so it does not show a Dock icon or a main window.
 
@@ -101,15 +101,15 @@ MSense is released under the MIT License.
 
 MSense — лёгкая open-source утилита для мониторинга Apple Silicon в строке меню macOS, написанная на Rust.
 
-Верхнее число в строке меню показывает максимальную температуру среди ядер процессора, нижнее — температуру GPU. По нажатию открывается подробное меню со всеми доступными показателями.
+Верхнее число в строке меню показывает максимальную температуру среди доступных датчиков CPU, нижнее — среднюю по датчикам GPU. По нажатию открывается подробное меню со всеми доступными показателями.
 
 ### Возможности
 
 - Температура CPU и GPU в строке меню
 - Автоматическое определение ядер Efficiency, Performance и Super, включая все 12 ядер M6
-- Температура, нагрузка и частота каждого ядра
+- Нагрузка и частота отдельных ядер. В CLI доступны температуры по именам аппаратных датчиков
 - Нагрузка, частота, температура и энергопотребление GPU
-- Использование оперативной памяти и swap в GiB: установленная память 24 GiB отображается как 24,00
+- Занятая RAM рассчитывается как «Используемая память» в Мониторинге системы. RAM и swap отображаются в GiB.
 - Энергопотребление CPU, GPU, Neural Engine, DRAM и всей вычислительной части
 - Информация о вентиляторах, если она доступна
 - Без лишних датчиков аккумулятора, трекпада, зарядного устройства и proximity
@@ -122,7 +122,7 @@ MSense — лёгкая open-source утилита для мониторинга
 
 Компьютеры Mac с процессорами Intel не поддерживаются.
 
-Поддержка M6 проверена на Mac18,1 с macOS 27: доступны температуры CPU/GPU и все три типа ядер. Привязка отдельных температурных датчиков M6 к физическим ядрам пока не подтверждена — меню показывает максимум CPU и среднюю температуру GPU. Частоты среднего типа ядер используют общую таблицу P-комплекса, как в macmon. На macOS 27 мощность CPU/GPU/ANE/DRAM читается из поддерживаемых счётчиков AppleCLPC. Недоступные счётчики отмечены как `unavailable`, а реальный ноль в простое остаётся нулём.
+Поддержка M6 проверена на Mac18,1 с macOS 27: доступны температуры CPU/GPU и все три типа ядер. Частоты среднего типа ядер используют общую таблицу P-комплекса, как в macmon. На macOS 27 мощность CPU/GPU/ANE/DRAM читается из поддерживаемых счётчиков AppleCLPC. Недоступные счётчики отмечены как `unavailable`, а реальный ноль в простое остаётся нулём.
 
 ### Проверка совместимости
 
@@ -131,7 +131,7 @@ MSense — лёгкая open-source утилита для мониторинга
 ### Установка
 
 1. Откройте страницу [Releases](../../releases).
-2. Скачайте `MSense-0.3.1-macOS-arm64.dmg` через Safari, Chrome или Firefox.
+2. Скачайте `MSense-0.3.2-macOS-arm64.dmg` через Safari, Chrome или Firefox.
 3. Откройте DMG и перетащите `MSense.app` в папку «Программы».
 4. Запустите MSense. Утилита работает в строке меню, поэтому у неё нет главного окна и значка в Dock.
 
